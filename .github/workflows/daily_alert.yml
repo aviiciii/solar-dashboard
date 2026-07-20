@@ -1,0 +1,29 @@
+name: Daily solar summary
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "30 15 * * *"  # 15:30 UTC = 21:00 IST
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      - run: uv run alerts/daily_alert.py
+        env:
+          POLYCAB_TOKEN: ${{ secrets.POLYCAB_TOKEN }}
+          MEMBER_AUTO_ID: ${{ secrets.MEMBER_AUTO_ID }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          WEATHER_LAT: ${{ secrets.WEATHER_LAT }}
+          WEATHER_LON: ${{ secrets.WEATHER_LON }}

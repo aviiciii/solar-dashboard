@@ -16,7 +16,6 @@ Every insert is `INSERT OR IGNORE` keyed on `timestamp`, so re-running this scri
 always safe and never duplicates rows.
 """
 
-import base64
 import json
 import logging
 import logging.handlers
@@ -27,103 +26,15 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import libsql
-import requests
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from polycab_client import call, num, AuthError, NetworkError, SchemaError  # noqa: E402
+
 IST = ZoneInfo("Asia/Kolkata")
 
-BASE_URL = "https://pv.polycabmonitoring.com/dist/server/api/CodeIgniter/index.php/Senergytec/web/v2/Inverterapi"
-
-# Hardcoded in the frontend JS bundle (umi.*.js) - not session-specific, see recon/notes.md.
-_SIGN_KEY1 = "05469137076236813460585715952089"
-_SIGN_KEY2 = "5161557162012237"
-
 STATUS_BY_COLOR = {"Green": "normal", "yellow": "standby", "red": "abnormal", "gray": "offline"}
-
-
-def _num(value) -> float | None:
-    """The API uses the literal string "-" (and sometimes "") as a placeholder for
-    unavailable readings, e.g. when the inverter has gone idle/offline - never a
-    numeric value in that case. Coerce anything non-numeric to None rather than
-    silently storing a string into a REAL column."""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-class AuthError(Exception):
-    """Token missing/expired/rejected. Retrying immediately won't help - back off."""
-
-
-class NetworkError(Exception):
-    """Connection/timeout/HTTP error - transient, our side or the Polycab server's."""
-
-
-class SchemaError(Exception):
-    """Got a 200 response but the JSON didn't look like what we expected."""
-
-
-def _sign(params: dict) -> str:
-    filtered = {k: v for k, v in params.items() if v not in ("", None) and not isinstance(v, bool)}
-    parts = []
-    for k in sorted(filtered.keys()):
-        v = filtered[k]
-        v_str = "Array" if isinstance(v, list) else str(v)
-        parts.append(f"{k}={v_str}")
-    canonical = "&".join(parts) + "&" + _SIGN_KEY1
-    cipher = AES.new(_SIGN_KEY1.encode(), AES.MODE_CBC, _SIGN_KEY2.encode())
-    ct = cipher.encrypt(pad(canonical.encode(), AES.block_size))
-    return base64.b64encode(ct).decode()
-
-
-def _call(endpoint: str, params: dict, token: str) -> dict:
-    body = dict(params)
-    body["sign"] = _sign(params)
-    try:
-        resp = requests.post(
-            f"{BASE_URL}/{endpoint}",
-            json=body,
-            headers={
-                "authorization": token,
-                "content-type": "application/json",
-                "accept": "application/json, text/plain, */*",
-            },
-            timeout=15,
-        )
-    except requests.RequestException as e:
-        raise NetworkError(f"{endpoint}: request failed: {e}") from e
-
-    if resp.status_code >= 400:
-        try:
-            err_body = resp.json()
-        except ValueError:
-            err_body = None
-        msg = str(err_body.get("message", "")) if isinstance(err_body, dict) else ""
-        looks_like_auth = resp.status_code in (401, 403) or any(
-            kw in msg.lower() for kw in ("token", "auth", "login", "permission", "denied")
-        )
-        detail = msg or resp.text[:200]
-        if looks_like_auth:
-            raise AuthError(f"{endpoint}: HTTP {resp.status_code}: {detail} - token likely "
-                             f"expired/invalid, re-extract it from the browser (see .env.example)")
-        raise NetworkError(f"{endpoint}: HTTP {resp.status_code}: {detail}")
-
-    try:
-        data = resp.json()
-    except ValueError as e:
-        raise SchemaError(f"{endpoint}: response wasn't valid JSON: {e}") from e
-
-    if isinstance(data, dict) and data.get("status") is False:
-        msg = str(data.get("message", ""))
-        if "token" in msg.lower() or "auth" in msg.lower() or "login" in msg.lower():
-            raise AuthError(f"{endpoint}: server rejected request: {msg}")
-        raise SchemaError(f"{endpoint}: server rejected request: {msg}")
-
-    return data
 
 
 def to_utc_iso(local_dt: datetime) -> str:
@@ -131,7 +42,7 @@ def to_utc_iso(local_dt: datetime) -> str:
 
 
 def fetch_live_reading(goods_id: str, member_auto_id: str, token: str) -> dict:
-    detail = _call("InverterDetailInfoNewone", {"GoodsID": goods_id}, token)
+    detail = call("InverterDetailInfoNewone", {"GoodsID": goods_id}, token)
     try:
         ac = detail["ACDCInfo"]
         data_time_str = detail["DataTime"]
@@ -143,7 +54,7 @@ def fetch_live_reading(goods_id: str, member_auto_id: str, token: str) -> dict:
 
     status = None
     try:
-        group_list = _call("GroupList", {"MemberAutoID": member_auto_id, "inputValue": ""}, token)
+        group_list = call("GroupList", {"MemberAutoID": member_auto_id, "inputValue": ""}, token)
         inv_status = group_list["AllGroupList"][0]["InverterStatus"]
         active_color = next((c for c, n in inv_status.items() if n), None)
         status = STATUS_BY_COLOR.get(active_color)
@@ -153,10 +64,10 @@ def fetch_live_reading(goods_id: str, member_auto_id: str, token: str) -> dict:
         logging.warning("could not determine status from GroupList: %s", e)
 
     def first(arr):
-        return _num(arr[0]) if arr else None
+        return num(arr[0]) if arr else None
 
-    daily_yield = _num(detail.get("EToday"))
-    total_yield = _num(detail.get("ETotal"))
+    daily_yield = num(detail.get("EToday"))
+    total_yield = num(detail.get("ETotal"))
 
     return {
         "timestamp": timestamp,
@@ -166,7 +77,7 @@ def fetch_live_reading(goods_id: str, member_auto_id: str, token: str) -> dict:
         "ac_voltage": first(ac.get("Vac")),
         "ac_current": first(ac.get("Iac")),
         "ac_frequency": first(ac.get("Fac")),
-        "temperature_c": _num(detail.get("Tntc")),
+        "temperature_c": num(detail.get("Tntc")),
         "status": status,
         "source": "live",
         "raw_json": json.dumps(detail),
@@ -177,10 +88,10 @@ def fetch_backfill_day(date_str: str, member_auto_id: str, token: str) -> list[d
     """date_str is a local (IST) calendar date 'YYYY-MM-DD'. Returns rows with only
     pv_power_w populated - the day-curve endpoint only ever gives instantaneous power,
     never the finer electrical detail or the true cumulative yield at each instant."""
-    result = _call("getAllPacDay_v1", {"MemberAutoID": member_auto_id, "date": date_str}, token)
+    result = call("getAllPacDay_v1", {"MemberAutoID": member_auto_id, "date": date_str}, token)
     rows = []
     for point in result.get("data", []):
-        pac_kw = _num(point.get("pac"))
+        pac_kw = num(point.get("pac"))
         if pac_kw is None:
             continue
         local_dt = datetime.strptime(f"{date_str} {point['inTime']}", "%Y-%m-%d %H:%M:%S")
