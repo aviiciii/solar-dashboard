@@ -1,0 +1,31 @@
+{
+  "AllGroupList": [
+    {
+      "InverterStatus": {
+        "Green": 0,
+        "yellow": 0,
+        "red": 0,
+        "gray": 1
+      },
+      "AutoID": "516036",
+      "GoodsTypeName": "Parthiban",
+      "GreenPercent": 0,
+      "Light": 4,
+      "CurrPac": 0,
+      "EToday": 10270,
+      "Htotal": 30,
+      "Price": "3.5",
+      "GoodsKWP": "5",
+      "effect": 2054,
+      "CreateDate": "2026-07-15 20:10:06",
+      "SetUpTime": "2026-07-15",
+      "LastUpdate": "2026-07-20 18:43:18",
+      "view": true,
+      "Inv": 1,
+      "GoodsTypePicName": null,
+      "checkPlantType": "4",
+      "ETotal": 26280,
+      "Unit": "USD"
+    }
+  ]
+}

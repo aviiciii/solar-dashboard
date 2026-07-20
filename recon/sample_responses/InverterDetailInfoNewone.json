@@ -1,0 +1,41 @@
+{
+  "type": "1",
+  "ACDCInfo": {
+    "Pac": [
+      0
+    ],
+    "Vac": [
+      241.6
+    ],
+    "Iac": [
+      0
+    ],
+    "Fac": [
+      50.03
+    ],
+    "Pdc": [
+      0
+    ],
+    "Vdc": [
+      186.5
+    ],
+    "Idc": [
+      0
+    ]
+  },
+  "ETotal": "26280",
+  "EToday": "10270",
+  "Htotal": "30",
+  "Tntc": "43",
+  "DataTime": "2026-07-20 21:13:18",
+  "WifiStrength": 0,
+  "MDSPVersion": "030100-05_411000",
+  "SDSPVersion": "060201-00_410001",
+  "CSBVersion": "CN0000",
+  "ESP32Version": {
+    "Version": "050400-10_012006",
+    "SN": "M32620-9039527EP",
+    "Status": "Offline"
+  },
+  "ModbusVersion": "-"
+}

@@ -1,0 +1,53 @@
+{
+  "type": "1",
+  "data": [
+    {
+      "inMonth": "01",
+      "pac": "0.05"
+    },
+    {
+      "inMonth": "02",
+      "pac": "0"
+    },
+    {
+      "inMonth": "03",
+      "pac": "0"
+    },
+    {
+      "inMonth": "04",
+      "pac": "0"
+    },
+    {
+      "inMonth": "05",
+      "pac": "0.00"
+    },
+    {
+      "inMonth": "06",
+      "pac": "0"
+    },
+    {
+      "inMonth": "07",
+      "pac": "26.23"
+    },
+    {
+      "inMonth": "08",
+      "pac": "0"
+    },
+    {
+      "inMonth": "09",
+      "pac": "0"
+    },
+    {
+      "inMonth": "10",
+      "pac": "0"
+    },
+    {
+      "inMonth": "11",
+      "pac": "0"
+    },
+    {
+      "inMonth": "12",
+      "pac": "0"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+[project]
+name = "solar-dashboard"
+version = "0.1.0"
+description = "Self-hosted solar monitoring: collector + Streamlit dashboard for a Polycab/Solarman-backed inverter"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "pycryptodome>=3.20",
+    "python-dotenv>=1.0",
+    "tzdata>=2024.1",
+]
