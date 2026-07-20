@@ -50,6 +50,7 @@ jobs:
           BACKFILL_START_DATE: ${{ secrets.BACKFILL_START_DATE }}
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           SCHEDULE: ${{ github.event.schedule }}
         run: |
           case "$SCHEDULE" in
@@ -60,17 +61,33 @@ jobs:
             *) duration_min=0 ;;  # manual workflow_dispatch: just run once
           esac
 
+          # collect.py exit codes: 0 ok, 1 transient network failure (self-heals, don't
+          # fail the job over it), 2 auth failure, 3 API schema change - the last two
+          # need a human, so they fail this job (collect.py itself already sent an ntfy
+          # alert), even though the loop keeps polling for the rest of the segment in
+          # case it's a one-off blip or gets fixed mid-run.
+          needs_human=0
+
           if [ "$duration_min" -eq 0 ]; then
-            uv run collector/collect.py
+            uv run collector/collect.py || { code=$?; [ "$code" -ge 2 ] && needs_human=1; }
           else
             end_time=$(( $(date +%s) + duration_min * 60 ))
             while [ "$(date +%s)" -lt "$end_time" ]; do
               iter_start=$(date +%s)
-              uv run collector/collect.py || echo "::warning::collect.py exited non-zero this cycle, continuing loop"
+              uv run collector/collect.py || {
+                code=$?
+                echo "::warning::collect.py exited $code this cycle, continuing loop"
+                [ "$code" -ge 2 ] && needs_human=1
+              }
               elapsed=$(( $(date +%s) - iter_start ))
               sleep_for=$(( 300 - elapsed ))
               if [ "$sleep_for" -gt 0 ]; then
                 sleep "$sleep_for"
               fi
             done
+          fi
+
+          if [ "$needs_human" -eq 1 ]; then
+            echo "::error::collector hit an auth failure or API schema change this segment - failing the job"
+            exit 1
           fi

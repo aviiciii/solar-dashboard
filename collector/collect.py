@@ -16,6 +16,12 @@ On each run it:
 Every insert is `INSERT OR IGNORE` keyed on `timestamp`, so re-running this script
 (including re-running backfill for a day that's already partially populated) is
 always safe and never duplicates rows.
+
+Exit codes: 0 = success/backoff-skip, 1 = transient network failure (self-heals via
+the backoff+retry below, doesn't need a human), 2 = auth failure, 3 = API schema
+change - the last two need a human, so they also send an ntfy alert (once per new
+failure streak, not every cycle) and are treated as job failures by collect.yml's
+loop (unlike exit 1, which the loop logs and continues past).
 """
 
 import json
@@ -33,10 +39,23 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 from polycab_client import call, num, MonthlyYields, AuthError, NetworkError, SchemaError  # noqa: E402
+from ntfy_client import send_ntfy  # noqa: E402
 
 IST = ZoneInfo("Asia/Kolkata")
 
 STATUS_BY_COLOR = {"Green": "normal", "yellow": "standby", "red": "abnormal", "gray": "offline"}
+
+
+def alert_once_per_failure_streak(ntfy_topic: str, was_already_failing: bool, title: str, message: str) -> None:
+    """Only notify on the *first* failure of a new streak - otherwise a stuck token
+    would fire an alert every 5 minutes for hours. Never lets a notify failure mask
+    the real error being reported."""
+    if was_already_failing or not ntfy_topic:
+        return
+    try:
+        send_ntfy(ntfy_topic, message, title=title)
+    except Exception as e:  # noqa: BLE001 - reporting the failure must not itself crash the run
+        logging.warning("could not send ntfy alert: %s", e)
 
 
 def to_utc_iso(local_dt: datetime) -> str:
@@ -230,6 +249,7 @@ def main() -> int:
     member_auto_id = os.environ.get("MEMBER_AUTO_ID", "").strip()
     turso_url = os.environ.get("TURSO_DATABASE_URL", "").strip()
     turso_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+    ntfy_topic = os.environ.get("NTFY_TOPIC", "").strip()
     if not (token and goods_id and member_auto_id and turso_url and turso_token):
         logging.error("missing required .env vars: POLYCAB_TOKEN / GOODS_ID / MEMBER_AUTO_ID / "
                        "TURSO_DATABASE_URL / TURSO_AUTH_TOKEN")
@@ -269,9 +289,15 @@ def main() -> int:
         return 0
     except AuthError as e:
         logging.error("AUTH FAILURE: %s", e)
+        was_already_failing = state["consecutive_failures"] > 0
         state["consecutive_failures"] += 1
         save_backoff_state(conn, state)
-        return 1
+        alert_once_per_failure_streak(
+            ntfy_topic, was_already_failing, "Solar collector: AUTH FAILURE",
+            f"{e}\n\nToken likely expired/invalid - re-extract it from the browser and "
+            f"update the POLYCAB_TOKEN secret.",
+        )
+        return 2
     except NetworkError as e:
         logging.error("NETWORK FAILURE: %s", e)
         state["consecutive_failures"] += 1
@@ -279,9 +305,14 @@ def main() -> int:
         return 1
     except SchemaError as e:
         logging.error("SCHEMA FAILURE (API response shape changed?): %s", e)
+        was_already_failing = state["consecutive_failures"] > 0
         state["consecutive_failures"] += 1
         save_backoff_state(conn, state)
-        return 1
+        alert_once_per_failure_streak(
+            ntfy_topic, was_already_failing, "Solar collector: SCHEMA FAILURE",
+            f"{e}\n\nThe Polycab API's response shape may have changed - needs investigation.",
+        )
+        return 3
     finally:
         conn.close()
 

@@ -138,36 +138,38 @@ def fetch_daily_kwh(_conn, start_date_str: str, end_date_str: str) -> dict:
 
 
 @st.cache_data(ttl=600)
-def fetch_hourly_weather_today(lat: str, lon: str, today_str: str) -> pd.DataFrame:
+def fetch_hourly_weather_today(lat: str, lon: str, today_str: str) -> tuple[pd.DataFrame, dict]:
     resp = requests.get(
         "https://api.open-meteo.com/v1/forecast",
         params={"latitude": lat, "longitude": lon, "hourly": "temperature_2m",
+                "daily": "sunrise,sunset",
                 "timezone": "Asia/Kolkata", "start_date": today_str, "end_date": today_str},
         timeout=15,
     )
     resp.raise_for_status()
-    d = resp.json()["hourly"]
+    body = resp.json()
+    h = body["hourly"]
     # Open-Meteo already returns these as local (Asia/Kolkata) wall-clock strings with no
     # UTC offset - keep them naive, matching fetch_today_readings' convention, rather than
     # attaching tzinfo Vega-Lite can't correctly interpret anyway.
-    return pd.DataFrame({"time": pd.to_datetime(d["time"]), "temperature_c": d["temperature_2m"]})
+    temp_df = pd.DataFrame({"time": pd.to_datetime(h["time"]), "temperature_c": h["temperature_2m"]})
+    daily = body.get("daily", {})
+    sun = {
+        "sunrise": daily["sunrise"][0].split("T")[1] if daily.get("sunrise") else None,
+        "sunset": daily["sunset"][0].split("T")[1] if daily.get("sunset") else None,
+    }
+    return temp_df, sun
 
 
-@st.cache_data(ttl=86400)
-def fetch_daily_weather_range(lat: str, lon: str, start_date_str: str, end_date_str: str) -> dict:
-    # The archive endpoint's reanalysis data has a few days' lag before it's finalized -
-    # requesting up through "today" gets a hard 400, not just missing recent days. Clamp
-    # the request a few days short rather than crashing; the last few days just won't
-    # have a temperature tooltip in the heatmap, which the UI already handles gracefully.
-    safe_end = min(date.fromisoformat(end_date_str), datetime.now(IST).date() - timedelta(days=5))
-    if safe_end < date.fromisoformat(start_date_str):
-        return {}
+def _fetch_weather_days(lat: str, lon: str, start_date_str: str, end_date_str: str, archive: bool) -> dict:
+    base_url = ("https://archive-api.open-meteo.com/v1/archive" if archive
+                else "https://api.open-meteo.com/v1/forecast")
     try:
         resp = requests.get(
-            "https://archive-api.open-meteo.com/v1/archive",
+            base_url,
             params={"latitude": lat, "longitude": lon,
                     "daily": "temperature_2m_max,temperature_2m_min",
-                    "timezone": "Asia/Kolkata", "start_date": start_date_str, "end_date": safe_end.isoformat()},
+                    "timezone": "Asia/Kolkata", "start_date": start_date_str, "end_date": end_date_str},
             timeout=20,
         )
         resp.raise_for_status()
@@ -177,6 +179,30 @@ def fetch_daily_weather_range(lat: str, lon: str, start_date_str: str, end_date_
         return {}
     return {t: {"max": tmax, "min": tmin}
             for t, tmax, tmin in zip(d["time"], d["temperature_2m_max"], d["temperature_2m_min"])}
+
+
+@st.cache_data(ttl=86400)
+def fetch_daily_weather_range(lat: str, lon: str, start_date_str: str, end_date_str: str) -> dict:
+    """The forecast endpoint reliably covers roughly the last ~90 days (including today),
+    but rejects anything further back. The archive endpoint covers arbitrary history, but
+    its reanalysis data has a few days' lag before it's finalized - a request touching
+    very recent days gets a hard 400, not just missing data. Split the request at that
+    boundary and use whichever endpoint actually supports each part, rather than routing
+    everything through archive and clamping away days it could never serve anyway (this
+    silently dropped ALL weather for a brand-new install, since its whole history so far
+    is more recent than archive's lag window)."""
+    start, end = date.fromisoformat(start_date_str), date.fromisoformat(end_date_str)
+    now_date = datetime.now(IST).date()
+    forecast_start = max(start, now_date - timedelta(days=90))
+
+    result = {}
+    if forecast_start <= end:
+        result.update(_fetch_weather_days(lat, lon, forecast_start.isoformat(), end.isoformat(), archive=False))
+    if start < forecast_start:
+        archive_end = min(end, forecast_start - timedelta(days=1), now_date - timedelta(days=5))
+        if start <= archive_end:
+            result.update(_fetch_weather_days(lat, lon, start.isoformat(), archive_end.isoformat(), archive=True))
+    return result
 
 
 conn = get_conn()
@@ -193,6 +219,14 @@ with tab_today:
     col2.metric("Today's Yield", f"{live['today_kwh']:.2f} kWh" if live and live["today_kwh"] is not None else "-")
     col3.metric("Status", (live["status"] or "unknown").capitalize() if live else "-")
     col4.metric("Last Update (IST)", live["last_update"] if live else "-")
+
+    today_str_for_sun = datetime.now(IST).date().isoformat()
+    sun = {}
+    if WEATHER_LAT and WEATHER_LON:
+        _, sun = fetch_hourly_weather_today(WEATHER_LAT, WEATHER_LON, today_str_for_sun)
+    sun_col1, sun_col2 = st.columns(2)
+    sun_col1.metric("Sunrise (IST)", sun.get("sunrise") or "-")
+    sun_col2.metric("Sunset (IST)", sun.get("sunset") or "-")
 
     with st.expander("Technical specs"):
         spec_col1, spec_col2 = st.columns(2)
@@ -235,9 +269,15 @@ with tab_today:
     x_end = datetime.combine(today, time(19, 0))
     x_scale = alt.Scale(domain=[x_start.isoformat(), x_end.isoformat()])
 
-    if df_today.empty:
-        st.info("No readings yet for today.")
-    else:
+    # Open-Meteo returns the whole day's forecast regardless of current time, so without
+    # clipping to "now" the temperature line would extend into hours that haven't happened
+    # yet - misleading alongside a power line that correctly stops at "now" (or doesn't
+    # exist yet at all, e.g. before sunrise/before the collector's first poll of the day).
+    now_naive = now_ist.replace(tzinfo=None)
+    weather_plot_end = min(x_end, now_naive)
+
+    power_chart = None
+    if not df_today.empty:
         power_chart = alt.Chart(df_today).mark_line(color="#f5a623", point=alt.OverlayMarkDef(size=30)).encode(
             x=alt.X("timestamp_ist:T", title="Time (IST)", scale=x_scale),
             y=alt.Y("pv_power_w:Q", title="Power (W)"),
@@ -245,12 +285,12 @@ with tab_today:
                      alt.Tooltip("pv_power_w:Q", title="Power (W)"),
                      alt.Tooltip("source:N", title="Source")],
         )
-        chart = power_chart
-        if show_temp and WEATHER_LAT and WEATHER_LON:
-            df_weather = fetch_hourly_weather_today(WEATHER_LAT, WEATHER_LON, today_str)
-            # Restrict to the same 06:00-19:00 window as the production data, rather than
-            # relying on the scale domain alone to crop a full 24h series.
-            df_weather = df_weather[(df_weather["time"] >= x_start) & (df_weather["time"] <= x_end)]
+
+    temp_chart = None
+    if show_temp and WEATHER_LAT and WEATHER_LON and weather_plot_end > x_start:
+        df_weather, _ = fetch_hourly_weather_today(WEATHER_LAT, WEATHER_LON, today_str)
+        df_weather = df_weather[(df_weather["time"] >= x_start) & (df_weather["time"] <= weather_plot_end)]
+        if not df_weather.empty:
             temp_chart = alt.Chart(df_weather).mark_line(
                 color="#4a90d9", strokeDash=[4, 2], point=alt.OverlayMarkDef(size=30, color="#4a90d9"),
             ).encode(
@@ -259,9 +299,16 @@ with tab_today:
                 tooltip=[alt.Tooltip("time:T", title="Time"),
                          alt.Tooltip("temperature_c:Q", title="Temp (°C)")],
             )
-            chart = alt.layer(power_chart, temp_chart).resolve_scale(y="independent")
-        st.altair_chart(chart.properties(height=400), width='stretch')
 
+    if power_chart is None and temp_chart is None:
+        st.info("No readings yet for today.")
+    elif power_chart is not None and temp_chart is not None:
+        st.altair_chart(alt.layer(power_chart, temp_chart).resolve_scale(y="independent")
+                         .properties(height=400), width='stretch')
+    else:
+        st.altair_chart((power_chart or temp_chart).properties(height=400), width='stretch')
+
+    if not df_today.empty:
         st.subheader("Cumulative production today")
         # Derived by integrating pv_power_w over time (trapezoidal rule) rather than
         # plotting the DB's own daily_yield_kwh column directly - that field is only ever

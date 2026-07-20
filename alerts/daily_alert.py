@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 from polycab_client import call, num, MonthlyYields, AuthError, NetworkError, SchemaError  # noqa: E402
+from ntfy_client import send_ntfy  # noqa: E402
 
 IST = ZoneInfo("Asia/Kolkata")
 UTC = ZoneInfo("UTC")
@@ -151,16 +152,6 @@ def build_message(today: date, today_kwh, yesterday_kwh, avg7_kwh, peak_kw, peak
     return "\n".join(lines)
 
 
-def send_ntfy(topic: str, message: str) -> None:
-    resp = requests.post(
-        f"https://ntfy.sh/{topic}",
-        data=message.encode("utf-8"),
-        headers={"Title": "Solar daily summary"},
-        timeout=15,
-    )
-    resp.raise_for_status()
-
-
 def main() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
     setup_logging(Path(os.environ.get("LOG_PATH", PROJECT_ROOT / "data" / "daily_alert.log")))
@@ -201,7 +192,7 @@ def main() -> int:
         message = build_message(today, today_kwh, yesterday_kwh, avg7_kwh, peak_kw, peak_time,
                                  gaps, weather)
         logging.info("sending notification:\n%s", message)
-        send_ntfy(ntfy_topic, message)
+        send_ntfy(ntfy_topic, message, title="Solar daily summary")
         logging.info("notification sent ok")
         return 0
     except AuthError as e:
