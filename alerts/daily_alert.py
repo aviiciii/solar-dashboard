@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from polycab_client import call, num, AuthError, NetworkError, SchemaError  # noqa: E402
+from polycab_client import call, num, MonthlyYields, AuthError, NetworkError, SchemaError  # noqa: E402
 
 IST = ZoneInfo("Asia/Kolkata")
 UTC = ZoneInfo("UTC")
@@ -52,27 +52,6 @@ def setup_logging(log_path: Path) -> None:
     root.setLevel(logging.INFO)
     root.addHandler(handler)
     root.addHandler(logging.StreamHandler(sys.stdout))
-
-
-class MonthlyYields:
-    """Caches getAllPacMonth responses per (year, month) so a 7-day lookback that
-    crosses a month boundary only fetches each month once."""
-
-    def __init__(self, member_auto_id: str, token: str):
-        self._member_auto_id = member_auto_id
-        self._token = token
-        self._cache: dict[tuple[int, int], dict[str, float | None]] = {}
-
-    def _month(self, year: int, month: int) -> dict[str, float | None]:
-        key = (year, month)
-        if key not in self._cache:
-            result = call("getAllPacMonth", {"MemberAutoID": self._member_auto_id,
-                                              "date": f"{year:04d}-{month:02d}"}, self._token)
-            self._cache[key] = {p["inDate"]: num(p.get("pac")) for p in result.get("data", [])}
-        return self._cache[key]
-
-    def yield_for(self, d: date) -> float | None:
-        return self._month(d.year, d.month).get(d.isoformat())
 
 
 def peak_power_today(member_auto_id: str, token: str, today: date) -> tuple[float | None, str | None]:

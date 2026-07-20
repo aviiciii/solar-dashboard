@@ -9,4 +9,9 @@ dependencies = [
     "python-dotenv>=1.0",
     "tzdata>=2024.1",
     "libsql>=0.1.11",
+    "streamlit>=1.59.2",
+    "altair>=6.2.2",
+    "pandas>=3.0.3",
+    "watchdog>=6.0.0",
+    "lesley>=0.3.1",
 ]

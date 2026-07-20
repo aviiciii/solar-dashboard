@@ -7,8 +7,10 @@ On each run it:
      skips (without hitting the network) if so.
   2. Backfills any missing days since the last successful poll (or since
      BACKFILL_START_DATE on a fresh/empty database), using the portal's own
-     historical intraday-power endpoint. Backfilled rows only carry power (W) and
-     timestamp - the finer AC/DC/temperature fields are only ever available live.
+     historical intraday-power endpoint. Backfilled rows carry power (W) and
+     timestamp for every interval, plus the day's authoritative total kWh (from
+     getAllPacMonth) on the day's last row - the finer AC/DC/temperature/status
+     fields are only ever available live.
   3. Polls the current live reading and inserts it.
 
 Every insert is `INSERT OR IGNORE` keyed on `timestamp`, so re-running this script
@@ -30,7 +32,7 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from polycab_client import call, num, AuthError, NetworkError, SchemaError  # noqa: E402
+from polycab_client import call, num, MonthlyYields, AuthError, NetworkError, SchemaError  # noqa: E402
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -84,10 +86,15 @@ def fetch_live_reading(goods_id: str, member_auto_id: str, token: str) -> dict:
     }
 
 
-def fetch_backfill_day(date_str: str, member_auto_id: str, token: str) -> list[dict]:
-    """date_str is a local (IST) calendar date 'YYYY-MM-DD'. Returns rows with only
-    pv_power_w populated - the day-curve endpoint only ever gives instantaneous power,
-    never the finer electrical detail or the true cumulative yield at each instant."""
+def fetch_backfill_day(date_str: str, member_auto_id: str, token: str, monthly_yields: MonthlyYields) -> list[dict]:
+    """date_str is a local (IST) calendar date 'YYYY-MM-DD'. The day-curve endpoint
+    (getAllPacDay_v1) only ever gives instantaneous power, never the finer electrical
+    detail or the true cumulative yield at each instant - so those stay None on every
+    row here. But the day's *final* cumulative yield is knowable (getAllPacMonth's
+    authoritative daily total), so it's set on the last/latest row of the day - the
+    same place a live poll's last-of-the-day reading would put it. Without this, a day
+    covered only by backfill (e.g. one from before the collector was actually running)
+    would have no daily kWh total anywhere in the DB at all."""
     result = call("getAllPacDay_v1", {"MemberAutoID": member_auto_id, "date": date_str}, token)
     rows = []
     for point in result.get("data", []):
@@ -108,6 +115,12 @@ def fetch_backfill_day(date_str: str, member_auto_id: str, token: str) -> list[d
             "source": "backfill",
             "raw_json": json.dumps(point),
         })
+
+    if rows:
+        day_total = monthly_yields.yield_for(date.fromisoformat(date_str))
+        if day_total is not None:
+            rows[-1]["daily_yield_kwh"] = day_total  # rows are chronological; last = latest
+
     return rows
 
 
@@ -238,8 +251,9 @@ def main() -> int:
     state["last_attempt"] = datetime.now(ZoneInfo("UTC")).isoformat()
 
     try:
+        monthly_yields = MonthlyYields(member_auto_id, token)
         for day in dates_needing_backfill(conn, backfill_start, stale_minutes, max_backfill_days):
-            rows = fetch_backfill_day(day, member_auto_id, token)
+            rows = fetch_backfill_day(day, member_auto_id, token, monthly_yields)
             inserted = insert_rows(conn, rows)
             logging.info("backfill %s: %d rows inserted (%d returned)", day, inserted, len(rows))
 

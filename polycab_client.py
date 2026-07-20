@@ -5,6 +5,7 @@ the signing scheme was reverse-engineered.
 """
 
 import base64
+from datetime import date
 
 import requests
 from Crypto.Cipher import AES
@@ -96,3 +97,26 @@ def call(endpoint: str, params: dict, token: str) -> dict:
         raise SchemaError(f"{endpoint}: server rejected request: {msg}")
 
     return data
+
+
+class MonthlyYields:
+    """Caches getAllPacMonth responses per (year, month) so looking up several days'
+    authoritative daily kWh totals that fall in the same month only fetches it once.
+    Used by both collector/collect.py (to backfill the daily total onto a day it only
+    has instantaneous power for) and alerts/daily_alert.py (7-day trailing average)."""
+
+    def __init__(self, member_auto_id: str, token: str):
+        self._member_auto_id = member_auto_id
+        self._token = token
+        self._cache: dict[tuple[int, int], dict[str, float | None]] = {}
+
+    def _month(self, year: int, month: int) -> dict[str, float | None]:
+        key = (year, month)
+        if key not in self._cache:
+            result = call("getAllPacMonth", {"MemberAutoID": self._member_auto_id,
+                                              "date": f"{year:04d}-{month:02d}"}, self._token)
+            self._cache[key] = {p["inDate"]: num(p.get("pac")) for p in result.get("data", [])}
+        return self._cache[key]
+
+    def yield_for(self, d: date) -> float | None:
+        return self._month(d.year, d.month).get(d.isoformat())
