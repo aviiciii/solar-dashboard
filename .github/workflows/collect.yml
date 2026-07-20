@@ -1,0 +1,76 @@
+name: Collect solar readings
+
+# GitHub's `schedule:` trigger is best-effort and can jitter by many minutes,
+# which matters if you need ~150 precise firings/day (every 5 min). Instead,
+# each `schedule:` entry below only needs to fire ONCE - kicking off a job that
+# then loops internally (real `sleep`, not GH's queue) every 5 minutes for its
+# segment. A single job is capped at 6h on GitHub-hosted runners, so the
+# 06:00-19:00 IST daylight window is split into 4 segments, each overlapping
+# the next by 1 hour - so if one kickoff is very late or never fires, the
+# neighboring segment's window already covers most of the gap.
+#
+# Segments (IST, each entry is the kickoff/start time):
+#   1. 06:00-10:15 (255 min)
+#   2. 09:15-13:30 (255 min)  <- overlaps segment 1 by 1h (09:15-10:15)
+#   3. 12:30-16:45 (255 min)  <- overlaps segment 2 by 1h (12:30-13:30)
+#   4. 15:45-19:00 (195 min)  <- overlaps segment 3 by 1h (15:45-16:45)
+# Converted to UTC (IST = UTC+5:30) for the cron fields below.
+#
+# Since segments now genuinely overlap in wall-clock time, multiple runs of
+# collect.py *will* execute concurrently during those windows - verified this
+# is safe: every insert is `INSERT OR IGNORE` keyed on `timestamp`, and the
+# single-row `collector_state` upsert uses `ON CONFLICT DO UPDATE`, both of
+# which are atomic at the DB level. No concurrency lock needed here.
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "30 0 * * *"  # 00:30 UTC = 06:00 IST - segment 1
+    - cron: "45 3 * * *"  # 03:45 UTC = 09:15 IST - segment 2
+    - cron: "0 7 * * *"   # 07:00 UTC = 12:30 IST - segment 3
+    - cron: "15 10 * * *" # 10:15 UTC = 15:45 IST - segment 4
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 280  # safety net; the loop below self-limits to <= 255 min
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      - name: Poll every 5 minutes for this segment
+        env:
+          POLYCAB_TOKEN: ${{ secrets.POLYCAB_TOKEN }}
+          GOODS_ID: ${{ secrets.GOODS_ID }}
+          MEMBER_AUTO_ID: ${{ secrets.MEMBER_AUTO_ID }}
+          BACKFILL_START_DATE: ${{ secrets.BACKFILL_START_DATE }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          case "$SCHEDULE" in
+            "30 0 * * *")  duration_min=255 ;;
+            "45 3 * * *")  duration_min=255 ;;
+            "0 7 * * *")   duration_min=255 ;;
+            "15 10 * * *") duration_min=195 ;;
+            *) duration_min=0 ;;  # manual workflow_dispatch: just run once
+          esac
+
+          if [ "$duration_min" -eq 0 ]; then
+            uv run collector/collect.py
+          else
+            end_time=$(( $(date +%s) + duration_min * 60 ))
+            while [ "$(date +%s)" -lt "$end_time" ]; do
+              iter_start=$(date +%s)
+              uv run collector/collect.py || echo "::warning::collect.py exited non-zero this cycle, continuing loop"
+              elapsed=$(( $(date +%s) - iter_start ))
+              sleep_for=$(( 300 - elapsed ))
+              if [ "$sleep_for" -gt 0 ]; then
+                sleep "$sleep_for"
+              fi
+            done
+          fi

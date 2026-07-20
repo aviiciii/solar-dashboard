@@ -8,4 +8,5 @@ dependencies = [
     "pycryptodome>=3.20",
     "python-dotenv>=1.0",
     "tzdata>=2024.1",
+    "libsql>=0.1.11",
 ]

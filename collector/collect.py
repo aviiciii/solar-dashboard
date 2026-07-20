@@ -21,12 +21,12 @@ import json
 import logging
 import logging.handlers
 import os
-import sqlite3
 import sys
 from datetime import datetime, timedelta, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import libsql
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -200,22 +200,28 @@ def fetch_backfill_day(date_str: str, member_auto_id: str, token: str) -> list[d
     return rows
 
 
-def insert_rows(conn: sqlite3.Connection, rows: list[dict]) -> int:
+_READING_COLUMNS = [
+    "timestamp", "pv_power_w", "daily_yield_kwh", "total_yield_kwh", "ac_voltage",
+    "ac_current", "ac_frequency", "temperature_c", "status", "source", "raw_json",
+]
+
+
+def insert_rows(conn, rows: list[dict]) -> int:
+    """libsql (unlike sqlite3) only supports positional `?` params, not named `:key`
+    ones - so rows are converted to tuples in _READING_COLUMNS order here."""
     if not rows:
         return 0
+    placeholders = ", ".join("?" for _ in _READING_COLUMNS)
+    values = [tuple(row[col] for col in _READING_COLUMNS) for row in rows]
     cur = conn.executemany(
-        """INSERT OR IGNORE INTO readings
-           (timestamp, pv_power_w, daily_yield_kwh, total_yield_kwh, ac_voltage,
-            ac_current, ac_frequency, temperature_c, status, source, raw_json)
-           VALUES (:timestamp, :pv_power_w, :daily_yield_kwh, :total_yield_kwh, :ac_voltage,
-                   :ac_current, :ac_frequency, :temperature_c, :status, :source, :raw_json)""",
-        rows,
+        f"INSERT OR IGNORE INTO readings ({', '.join(_READING_COLUMNS)}) VALUES ({placeholders})",
+        values,
     )
     conn.commit()
     return cur.rowcount
 
 
-def dates_needing_backfill(conn: sqlite3.Connection, backfill_start: date | None, stale_minutes: int,
+def dates_needing_backfill(conn, backfill_start: date | None, stale_minutes: int,
                             max_days: int) -> list[str]:
     today_local = datetime.now(IST).date()
 
@@ -249,17 +255,23 @@ def _daterange(start: date, end: date) -> list[str]:
     return [(start + timedelta(days=n)).isoformat() for n in range((end - start).days + 1)]
 
 
-def load_backoff_state(state_path: Path) -> dict:
-    if not state_path.exists():
+def load_backoff_state(conn) -> dict:
+    """Backoff state lives in the DB, not a local file - the collector runs on
+    ephemeral compute (GitHub Actions) with no disk that persists between runs."""
+    row = conn.execute("SELECT consecutive_failures, last_attempt FROM collector_state WHERE id = 1").fetchone()
+    if row is None:
         return {"consecutive_failures": 0, "last_attempt": None}
-    try:
-        return json.loads(state_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {"consecutive_failures": 0, "last_attempt": None}
+    return {"consecutive_failures": row[0], "last_attempt": row[1]}
 
 
-def save_backoff_state(state_path: Path, state: dict) -> None:
-    state_path.write_text(json.dumps(state))
+def save_backoff_state(conn, state: dict) -> None:
+    conn.execute(
+        """INSERT INTO collector_state (id, consecutive_failures, last_attempt) VALUES (1, ?, ?)
+           ON CONFLICT (id) DO UPDATE SET consecutive_failures = excluded.consecutive_failures,
+                                           last_attempt = excluded.last_attempt""",
+        (state["consecutive_failures"], state["last_attempt"]),
+    )
+    conn.commit()
 
 
 def backoff_minutes_for(consecutive_failures: int) -> int:
@@ -281,9 +293,7 @@ def setup_logging(log_path: Path) -> None:
 def main() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
 
-    db_path = Path(os.environ.get("DB_PATH", PROJECT_ROOT / "data" / "readings.db"))
     log_path = Path(os.environ.get("LOG_PATH", PROJECT_ROOT / "data" / "collector.log"))
-    state_path = Path(os.environ.get("STATE_PATH", PROJECT_ROOT / "data" / "collector_state.json"))
     stale_minutes = int(os.environ.get("STALE_MINUTES", "20"))
     max_backfill_days = int(os.environ.get("MAX_BACKFILL_DAYS_PER_RUN", "60"))
     backfill_start_str = os.environ.get("BACKFILL_START_DATE", "").strip()
@@ -294,11 +304,17 @@ def main() -> int:
     token = os.environ.get("POLYCAB_TOKEN", "").strip()
     goods_id = os.environ.get("GOODS_ID", "").strip()
     member_auto_id = os.environ.get("MEMBER_AUTO_ID", "").strip()
-    if not (token and goods_id and member_auto_id):
-        logging.error("missing required .env vars: POLYCAB_TOKEN / GOODS_ID / MEMBER_AUTO_ID")
+    turso_url = os.environ.get("TURSO_DATABASE_URL", "").strip()
+    turso_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+    if not (token and goods_id and member_auto_id and turso_url and turso_token):
+        logging.error("missing required .env vars: POLYCAB_TOKEN / GOODS_ID / MEMBER_AUTO_ID / "
+                       "TURSO_DATABASE_URL / TURSO_AUTH_TOKEN")
         return 1
 
-    state = load_backoff_state(state_path)
+    conn = libsql.connect(turso_url, auth_token=turso_token)
+    conn.executescript((PROJECT_ROOT / "db" / "schema.sql").read_text())
+
+    state = load_backoff_state(conn)
     if state["consecutive_failures"] > 0 and state["last_attempt"]:
         cooldown = backoff_minutes_for(state["consecutive_failures"])
         elapsed = datetime.now(ZoneInfo("UTC")) - datetime.fromisoformat(state["last_attempt"])
@@ -307,10 +323,6 @@ def main() -> int:
                              "(retry in %.0f min)", state["consecutive_failures"],
                              (timedelta(minutes=cooldown) - elapsed).total_seconds() / 60)
             return 0
-
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.executescript((PROJECT_ROOT / "db" / "schema.sql").read_text())
 
     state["last_attempt"] = datetime.now(ZoneInfo("UTC")).isoformat()
 
@@ -327,27 +339,26 @@ def main() -> int:
             live_row["timestamp"], live_row["pv_power_w"], live_row["daily_yield_kwh"],
             live_row["total_yield_kwh"], live_row["status"], "inserted" if inserted else "already had it",
         )
+        state["consecutive_failures"] = 0
+        save_backoff_state(conn, state)
+        return 0
     except AuthError as e:
         logging.error("AUTH FAILURE: %s", e)
         state["consecutive_failures"] += 1
-        save_backoff_state(state_path, state)
+        save_backoff_state(conn, state)
         return 1
     except NetworkError as e:
         logging.error("NETWORK FAILURE: %s", e)
         state["consecutive_failures"] += 1
-        save_backoff_state(state_path, state)
+        save_backoff_state(conn, state)
         return 1
     except SchemaError as e:
         logging.error("SCHEMA FAILURE (API response shape changed?): %s", e)
         state["consecutive_failures"] += 1
-        save_backoff_state(state_path, state)
+        save_backoff_state(conn, state)
         return 1
     finally:
         conn.close()
-
-    state["consecutive_failures"] = 0
-    save_backoff_state(state_path, state)
-    return 0
 
 
 if __name__ == "__main__":
