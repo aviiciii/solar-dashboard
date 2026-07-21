@@ -26,6 +26,10 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 IST = ZoneInfo("Asia/Kolkata")
 UTC = ZoneInfo("UTC")
+# InverterDetailInfoNewone's DataTime is the device's own RTC clock, reported in China
+# Standard Time (UTC+8) regardless of the plant's actual location - confirmed empirically
+# against real clock time. See the matching comment in collector/collect.py.
+DEVICE_CLOCK_TZ = ZoneInfo("Asia/Shanghai")
 
 POLYCAB_TOKEN = os.environ.get("POLYCAB_TOKEN", "").strip()
 GOODS_ID = os.environ.get("GOODS_ID", "").strip()
@@ -79,13 +83,18 @@ def fetch_live_snapshot():
     def first(arr):
         return num(arr[0]) if arr else None
 
+    last_update_ist = None
+    if detail.get("DataTime"):
+        last_update_ist = (datetime.strptime(detail["DataTime"], "%Y-%m-%d %H:%M:%S")
+                            .replace(tzinfo=DEVICE_CLOCK_TZ).astimezone(IST))
+
     return {
         "power_w": first(ac.get("Pac")),
         "today_kwh": today_kwh / 1000 if today_kwh is not None else None,
         "total_kwh": total_kwh / 1000 if total_kwh is not None else None,
         "temperature_c": num(detail.get("Tntc")),
         "status": STATUS_BY_COLOR.get(active_color),
-        "last_update": detail.get("DataTime"),
+        "last_update": last_update_ist.strftime("%Y-%m-%d %H:%M:%S") if last_update_ist else None,
         "mdsp_version": detail.get("MDSPVersion"),
         "sdsp_version": detail.get("SDSPVersion"),
         "csb_version": detail.get("CSBVersion"),

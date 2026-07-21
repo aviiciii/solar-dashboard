@@ -42,6 +42,13 @@ from polycab_client import call, num, MonthlyYields, AuthError, NetworkError, Sc
 from ntfy_client import send_ntfy  # noqa: E402
 
 IST = ZoneInfo("Asia/Kolkata")
+# InverterDetailInfoNewone's DataTime field is the device's own RTC clock, reported in
+# China Standard Time (UTC+8) regardless of the plant's actual location/configured
+# timezone (+5:30) - confirmed empirically: a live DataTime matched real-world UTC+8
+# clock time to within ~2 minutes, but was 2.5h ahead of real IST time. getAllPacDay_v1's
+# `inTime` (used for backfill) is genuinely IST - it's parameterized by date/account
+# timezone server-side, not the raw device clock, and lines up correctly with real time.
+DEVICE_CLOCK_TZ = ZoneInfo("Asia/Shanghai")
 
 STATUS_BY_COLOR = {"Green": "normal", "yellow": "standby", "red": "abnormal", "gray": "offline"}
 
@@ -58,8 +65,8 @@ def alert_once_per_failure_streak(ntfy_topic: str, was_already_failing: bool, ti
         logging.warning("could not send ntfy alert: %s", e)
 
 
-def to_utc_iso(local_dt: datetime) -> str:
-    return local_dt.replace(tzinfo=IST).astimezone(ZoneInfo("UTC")).isoformat()
+def to_utc_iso(local_dt: datetime, tz: ZoneInfo = IST) -> str:
+    return local_dt.replace(tzinfo=tz).astimezone(ZoneInfo("UTC")).isoformat()
 
 
 def fetch_live_reading(goods_id: str, member_auto_id: str, token: str) -> dict:
@@ -71,7 +78,7 @@ def fetch_live_reading(goods_id: str, member_auto_id: str, token: str) -> dict:
         raise SchemaError(f"InverterDetailInfoNewone: missing expected field {e}") from e
 
     local_dt = datetime.strptime(data_time_str, "%Y-%m-%d %H:%M:%S")
-    timestamp = to_utc_iso(local_dt)
+    timestamp = to_utc_iso(local_dt, tz=DEVICE_CLOCK_TZ)
 
     status = None
     try:

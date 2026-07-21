@@ -46,10 +46,21 @@ on demand, never 24/7.
   `null`), e.g. when the inverter's been idle. Always pass API numeric fields through
   `polycab_client.num()` rather than `float()` directly, or you'll silently write a string
   into a `REAL` column (SQLite allows this without error, so it fails silently, not loudly).
-- **Backfilled rows only ever populate `pv_power_w` + `timestamp`** (`source='backfill'`).
-  The day-curve endpoint (`getAllPacDay_v1`) only ever gives instantaneous power, never
-  voltage/current/frequency/temperature or true cumulative yield - don't assume those columns
-  are populated without checking `source`.
+- **Backfilled rows (`source='backfill'`) only ever populate `pv_power_w` + `timestamp` per
+  interval** - the day-curve endpoint (`getAllPacDay_v1`) never gives voltage/current/
+  frequency/temperature. The day's *last* backfilled row also gets `daily_yield_kwh` set
+  from `getAllPacMonth` (via the shared `MonthlyYields` helper in `polycab_client.py`), so
+  a backfill-only day still has a correct total for the heatmap - but don't assume any
+  other row/column is populated without checking `source`.
+- **`InverterDetailInfoNewone`'s `DataTime` field is the device's own RTC clock, reported
+  in China Standard Time (UTC+8), not the plant's actual timezone (IST, UTC+5:30).**
+  Confirmed empirically: a live `DataTime` matched real-world UTC+8 clock time to within
+  ~2 minutes, but was 2.5h ahead of real IST time - both collector/collect.py (see
+  `DEVICE_CLOCK_TZ`) and dashboard/app.py's live snapshot convert it accordingly before
+  use. `getAllPacDay_v1`'s `inTime` (used for backfill) is NOT affected - it's computed
+  server-side from the requested date/account timezone, not the device's raw clock, and
+  lines up correctly with real IST time. If a future endpoint ever surfaces another
+  device-reported timestamp, verify its timezone empirically rather than assuming IST.
 - **`TURSO_API_TOKEN` is intentionally not a GitHub Actions secret.** It's a
   platform/management-scope token (decodes to `{org_id}`, no database scope) used only for
   one-time manual provisioning (creating the group/database/token via `api.turso.tech`) -
