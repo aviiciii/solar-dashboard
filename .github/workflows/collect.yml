@@ -72,18 +72,26 @@ jobs:
             uv run collector/collect.py || { code=$?; [ "$code" -ge 2 ] && needs_human=1; }
           else
             end_time=$(( $(date +%s) + duration_min * 60 ))
-            while [ "$(date +%s)" -lt "$end_time" ]; do
-              iter_start=$(date +%s)
+            interval=300
+            # Align every cycle to a real clock boundary (:00/:05/:10/...) rather than
+            # whatever second the segment happened to kick off at - 300 divides evenly
+            # into a day, so (epoch / interval + 1) * interval always lands exactly on
+            # one, in both UTC and IST (IST's +5:30 offset is itself a multiple of 5 min).
+            while true; do
+              now=$(date +%s)
+              target=$(( (now / interval + 1) * interval ))
+              if [ "$target" -gt "$end_time" ]; then
+                break
+              fi
+              sleep_for=$(( target - now ))
+              if [ "$sleep_for" -gt 0 ]; then
+                sleep "$sleep_for"
+              fi
               uv run collector/collect.py || {
                 code=$?
                 echo "::warning::collect.py exited $code this cycle, continuing loop"
                 [ "$code" -ge 2 ] && needs_human=1
               }
-              elapsed=$(( $(date +%s) - iter_start ))
-              sleep_for=$(( 300 - elapsed ))
-              if [ "$sleep_for" -gt 0 ]; then
-                sleep "$sleep_for"
-              fi
             done
           fi
 
