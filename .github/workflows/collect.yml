@@ -5,12 +5,20 @@ name: Collect solar readings
 # each `schedule:` entry below only needs to fire ONCE - kicking off a job that
 # then loops internally (real `sleep`, not GH's queue) every 5 minutes for its
 # segment. A single job is capped at 6h on GitHub-hosted runners, so the
-# 06:00-19:00 IST daylight window is split into 4 segments, each overlapping
-# the next by 1 hour - so if one kickoff is very late or never fires, the
+# 06:00-19:00 IST daylight window is split into segments, each overlapping the
+# next by 1 hour - so if one kickoff is very late or never fires, the
 # neighboring segment's window already covers most of the gap.
 #
+# In practice GH's scheduler has been delaying these by 2-3.5h (observed, not
+# just the "tens of minutes" jitter the 1h overlaps were originally sized for),
+# so segment 0 below exists purely as a buffer: nominally 03:00 IST, it's
+# expected to often actually fire closer to 6am given that same delay, giving
+# the real 06:00 segment a head start instead of the whole day's collection
+# starting hours late.
+#
 # Segments (IST, each entry is the kickoff/start time):
-#   1. 06:00-10:15 (255 min)
+#   0. 03:00-07:00 (240 min)  <- buffer against GH's scheduler delay, see above
+#   1. 06:00-10:15 (255 min)  <- overlaps segment 0 by 1h (06:00-07:00)
 #   2. 09:15-13:30 (255 min)  <- overlaps segment 1 by 1h (09:15-10:15)
 #   3. 12:30-16:45 (255 min)  <- overlaps segment 2 by 1h (12:30-13:30)
 #   4. 15:45-19:00 (195 min)  <- overlaps segment 3 by 1h (15:45-16:45)
@@ -24,6 +32,7 @@ name: Collect solar readings
 on:
   workflow_dispatch: {}
   schedule:
+    - cron: "30 21 * * *" # 21:30 UTC = 03:00 IST (next day) - segment 0
     - cron: "30 0 * * *"  # 00:30 UTC = 06:00 IST - segment 1
     - cron: "45 3 * * *"  # 03:45 UTC = 09:15 IST - segment 2
     - cron: "0 7 * * *"   # 07:00 UTC = 12:30 IST - segment 3
@@ -34,6 +43,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 280  # safety net; the loop below self-limits to <= 255 min
     steps:
+      # Streamlit Community Cloud puts the dashboard app to sleep after ~12h with no
+      # traffic. This job already runs every ~3-4h across the day (5 segments), so one
+      # ping per runner is enough to keep it awake without a dedicated schedule of its
+      # own. `--max-time 60` gives it room to actually cold-boot on the request that
+      # wakes it; failure here is non-fatal and never affects collector success/failure.
+      #
+      # A bare `curl` here gets stuck in Streamlit Cloud's session-bootstrap redirect
+      # (bounces through share.streamlit.io/-/auth/app without a real browser UA + cookie
+      # jar to carry the Set-Cookie across hops, never reaching actual app content) -
+      # confirmed by testing both ways. `-L` + a UA + a cookie jar resolves it in 3 hops.
+      - name: Ping dashboard to prevent Streamlit Cloud sleep
+        run: |
+          curl -sL --max-redirs 15 --max-time 60 -o /dev/null \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36" \
+            -c /tmp/streamlit_cookies.txt -b /tmp/streamlit_cookies.txt \
+            -w "dashboard ping: HTTP %{http_code} after %{num_redirects} redirect(s)\n" \
+            https://homesolar.streamlit.app/ || echo "::warning::dashboard ping failed, continuing"
+
       - uses: actions/checkout@v7
 
       - uses: astral-sh/setup-uv@v8.3.2
@@ -54,6 +81,7 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
         run: |
           case "$SCHEDULE" in
+            "30 21 * * *") duration_min=240 ;;
             "30 0 * * *")  duration_min=255 ;;
             "45 3 * * *")  duration_min=255 ;;
             "0 7 * * *")   duration_min=255 ;;
