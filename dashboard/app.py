@@ -108,15 +108,17 @@ def fetch_last_sync(_conn):
 
 
 @st.cache_data(ttl=60)
-def fetch_today_readings(_conn, today_str: str) -> pd.DataFrame:
-    day_start_utc = datetime.combine(date.fromisoformat(today_str), time.min, IST).astimezone(UTC)
+def fetch_day_readings(_conn, date_str: str) -> pd.DataFrame:
+    """Used by both the Today and Day tabs - a past day's data never changes, so the 60s
+    TTL only really matters for today's still-accumulating readings."""
+    day_start_utc = datetime.combine(date.fromisoformat(date_str), time.min, IST).astimezone(UTC)
     day_end_utc = day_start_utc + timedelta(days=1)
     rows = _conn.execute(
-        "SELECT timestamp, pv_power_w, source FROM readings "
+        "SELECT timestamp, pv_power_w, source, daily_yield_kwh, status FROM readings "
         "WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
         (day_start_utc.isoformat(), day_end_utc.isoformat()),
     ).fetchall()
-    df = pd.DataFrame(rows, columns=["timestamp_utc", "pv_power_w", "source"])
+    df = pd.DataFrame(rows, columns=["timestamp_utc", "pv_power_w", "source", "daily_yield_kwh", "status"])
     if not df.empty:
         df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
         # Vega-Lite has no real IANA-timezone support (only UTC or browser-local), so a
@@ -125,6 +127,28 @@ def fetch_today_readings(_conn, today_str: str) -> pd.DataFrame:
         # entirely since both the data and the axis domain below use the same convention.
         df["timestamp_ist"] = df["timestamp_utc"].dt.tz_convert(IST).dt.tz_localize(None)
     return df
+
+
+def compute_day_metrics(df: pd.DataFrame) -> dict:
+    """Everything here comes straight from our own DB (not the live API) - this is what
+    powers the Day tab's metrics for an arbitrary (including past) date."""
+    if df.empty:
+        return {"total_kwh": None, "peak_w": None, "peak_time": None, "status": None, "last_reading": None}
+
+    total_kwh = df["daily_yield_kwh"].max() if df["daily_yield_kwh"].notna().any() else None
+
+    peak_w = peak_time = None
+    if df["pv_power_w"].notna().any():
+        peak_idx = df["pv_power_w"].idxmax()
+        peak_w = df.loc[peak_idx, "pv_power_w"]
+        peak_time = df.loc[peak_idx, "timestamp_ist"].strftime("%H:%M")
+
+    status_series = df["status"].dropna()
+    status = status_series.iloc[-1] if not status_series.empty else None
+    last_reading = df["timestamp_ist"].max().strftime("%Y-%m-%d %H:%M:%S")
+
+    return {"total_kwh": total_kwh, "peak_w": peak_w, "peak_time": peak_time,
+            "status": status, "last_reading": last_reading}
 
 
 @st.cache_data(ttl=300)
@@ -146,28 +170,69 @@ def fetch_daily_kwh(_conn, start_date_str: str, end_date_str: str) -> dict:
     return {r[0]: r[1] for r in rows}
 
 
-@st.cache_data(ttl=600)
-def fetch_hourly_weather_today(lat: str, lon: str, today_str: str) -> tuple[pd.DataFrame, dict]:
-    resp = requests.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={"latitude": lat, "longitude": lon, "hourly": "temperature_2m",
-                "daily": "sunrise,sunset",
-                "timezone": "Asia/Kolkata", "start_date": today_str, "end_date": today_str},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    body = resp.json()
-    h = body["hourly"]
+def week_bounds(d: date) -> tuple[date, date]:
+    """Monday-Sunday bounds of the week containing d (date.weekday(): Monday=0)."""
+    monday = d - timedelta(days=d.weekday())
+    return monday, monday + timedelta(days=6)
+
+
+def month_bounds(d: date) -> tuple[date, date]:
+    first = d.replace(day=1)
+    next_first = date(d.year + 1, 1, 1) if d.month == 12 else date(d.year, d.month + 1, 1)
+    return first, next_first - timedelta(days=1)
+
+
+def avg_kwh_in_range(kwh_by_date: dict, start: date, end: date) -> float | None:
+    """Average over days actually recorded in [start, end] - missing days (e.g. before
+    install, or not yet collected) are excluded rather than treated as zero, so an
+    average early in a period isn't misleadingly dragged down by days with no data."""
+    vals = [v for n in range((end - start).days + 1)
+            if (v := kwh_by_date.get((start + timedelta(days=n)).isoformat())) is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _fetch_hourly_weather_days(lat: str, lon: str, date_str: str, archive: bool) -> tuple[pd.DataFrame, dict]:
+    base_url = ("https://archive-api.open-meteo.com/v1/archive" if archive
+                else "https://api.open-meteo.com/v1/forecast")
+    try:
+        resp = requests.get(
+            base_url,
+            params={"latitude": lat, "longitude": lon, "hourly": "temperature_2m",
+                    "daily": "sunrise,sunset",
+                    "timezone": "Asia/Kolkata", "start_date": date_str, "end_date": date_str},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+    except (requests.RequestException, KeyError, ValueError) as e:
+        st.warning(f"Could not fetch weather for {date_str} ({e}).")
+        return pd.DataFrame(columns=["time", "temperature_c"]), {}
+
+    h = body.get("hourly", {})
     # Open-Meteo already returns these as local (Asia/Kolkata) wall-clock strings with no
-    # UTC offset - keep them naive, matching fetch_today_readings' convention, rather than
+    # UTC offset - keep them naive, matching fetch_day_readings' convention, rather than
     # attaching tzinfo Vega-Lite can't correctly interpret anyway.
-    temp_df = pd.DataFrame({"time": pd.to_datetime(h["time"]), "temperature_c": h["temperature_2m"]})
+    temp_df = pd.DataFrame({"time": pd.to_datetime(h.get("time", [])), "temperature_c": h.get("temperature_2m", [])})
     daily = body.get("daily", {})
     sun = {
         "sunrise": daily["sunrise"][0].split("T")[1] if daily.get("sunrise") else None,
         "sunset": daily["sunset"][0].split("T")[1] if daily.get("sunset") else None,
     }
     return temp_df, sun
+
+
+@st.cache_data(ttl=600)
+def fetch_hourly_weather_for_date(lat: str, lon: str, date_str: str) -> tuple[pd.DataFrame, dict]:
+    """The forecast endpoint reliably covers ~90 days back (and today/near future); the
+    archive endpoint covers arbitrary history but lags ~5 days before being finalized -
+    same split rationale as fetch_daily_weather_range, just at hourly granularity, and
+    confirmed the archive endpoint also serves sunrise/sunset for arbitrary past dates
+    (it's pure astronomy, not weather-dependent, so no lag issue there specifically -
+    but it's simpler to fetch both from whichever single endpoint the split picks)."""
+    d = date.fromisoformat(date_str)
+    now_date = datetime.now(IST).date()
+    use_archive = d < now_date - timedelta(days=89)
+    return _fetch_hourly_weather_days(lat, lon, date_str, archive=use_archive)
 
 
 def _fetch_weather_days(lat: str, lon: str, start_date_str: str, end_date_str: str, archive: bool) -> dict:
@@ -214,8 +279,97 @@ def fetch_daily_weather_range(lat: str, lon: str, start_date_str: str, end_date_
     return result
 
 
+def render_production_section(conn, selected_date: date, key_prefix: str) -> None:
+    """Intraday power chart (+ optional ambient-temperature overlay) and the cumulative-
+    production chart, for any date - shared by both the Today and Day tabs. `key_prefix`
+    keeps the checkbox's Streamlit widget key unique between the two tabs."""
+    today = datetime.now(IST).date()
+    date_str = selected_date.isoformat()
+    df = fetch_day_readings(conn, date_str)
+    is_today = selected_date == today
+
+    st.subheader("Today's production" if is_today else f"Production on {date_str}")
+    show_temp = st.checkbox("Overlay ambient temperature", value=False, key=f"{key_prefix}_temp_toggle")
+
+    # Naive (no tzinfo) to match the naive IST wall-clock values in the dataframes above -
+    # see the comment in fetch_day_readings for why.
+    x_start = datetime.combine(selected_date, time(6, 0))
+    x_end = datetime.combine(selected_date, time(19, 0))
+    x_scale = alt.Scale(domain=[x_start.isoformat(), x_end.isoformat()])
+
+    if is_today:
+        # Open-Meteo returns the whole day's forecast regardless of current time, so
+        # without clipping to "now" the temperature line would extend into hours that
+        # haven't happened yet - misleading alongside a power line that correctly stops
+        # at "now" (or doesn't exist yet at all, e.g. before sunrise/first poll).
+        now_naive = datetime.now(IST).replace(tzinfo=None)
+        weather_plot_end = min(x_end, now_naive)
+    else:
+        weather_plot_end = x_end  # the whole day has already happened, no "future" to clip
+
+    power_chart = None
+    if not df.empty:
+        power_chart = alt.Chart(df).mark_line(color="#f5a623", point=alt.OverlayMarkDef(size=30)).encode(
+            x=alt.X("timestamp_ist:T", title="Time (IST)", scale=x_scale),
+            y=alt.Y("pv_power_w:Q", title="Power (W)"),
+            tooltip=[alt.Tooltip("timestamp_ist:T", title="Time"),
+                     alt.Tooltip("pv_power_w:Q", title="Power (W)"),
+                     alt.Tooltip("source:N", title="Source")],
+        )
+
+    temp_chart = None
+    if show_temp and WEATHER_LAT and WEATHER_LON and weather_plot_end > x_start:
+        df_weather, _ = fetch_hourly_weather_for_date(WEATHER_LAT, WEATHER_LON, date_str)
+        df_weather = df_weather[(df_weather["time"] >= x_start) & (df_weather["time"] <= weather_plot_end)]
+        if not df_weather.empty:
+            temp_chart = alt.Chart(df_weather).mark_line(
+                color="#4a90d9", strokeDash=[4, 2], point=alt.OverlayMarkDef(size=30, color="#4a90d9"),
+            ).encode(
+                x=alt.X("time:T", scale=x_scale),
+                y=alt.Y("temperature_c:Q", title="Temp (°C)", scale=alt.Scale(zero=False)),
+                tooltip=[alt.Tooltip("time:T", title="Time"),
+                         alt.Tooltip("temperature_c:Q", title="Temp (°C)")],
+            )
+
+    if power_chart is None and temp_chart is None:
+        st.info("No readings yet for today." if is_today else "No readings recorded for this day.")
+    elif power_chart is not None and temp_chart is not None:
+        st.altair_chart(alt.layer(power_chart, temp_chart).resolve_scale(y="independent")
+                         .properties(height=400), width='stretch')
+    else:
+        st.altair_chart((power_chart or temp_chart).properties(height=400), width='stretch')
+
+    if not df.empty:
+        st.subheader("Cumulative production today" if is_today else "Cumulative production")
+        # Derived by integrating pv_power_w over time (trapezoidal rule) rather than
+        # plotting the DB's own daily_yield_kwh column directly - that field is only ever
+        # populated on `live` rows, which can be sparse (e.g. on a day mostly covered by
+        # backfill), so it wouldn't give a continuous curve. This approximation converges
+        # to roughly the real EToday total by end of day at 5-min sampling resolution.
+        cum_df = df.sort_values("timestamp_ist").reset_index(drop=True)
+        dt_hours = cum_df["timestamp_ist"].diff().dt.total_seconds().fillna(0) / 3600
+        power_filled = cum_df["pv_power_w"].fillna(0)
+        avg_power = (power_filled + power_filled.shift(1).fillna(power_filled)) / 2
+        cum_df["cumulative_kwh"] = (dt_hours * avg_power / 1000).cumsum()
+
+        cum_chart = alt.Chart(cum_df).mark_line(color="#2e8b57", point=alt.OverlayMarkDef(size=30, color="#2e8b57")).encode(
+            x=alt.X("timestamp_ist:T", title="Time (IST)", scale=x_scale),
+            y=alt.Y("cumulative_kwh:Q", title="Cumulative energy (kWh)"),
+            tooltip=[alt.Tooltip("timestamp_ist:T", title="Time"),
+                     alt.Tooltip("cumulative_kwh:Q", title="Cumulative kWh", format=".2f"),
+                     alt.Tooltip("source:N", title="Source")],
+        )
+        st.altair_chart(cum_chart.properties(height=300), width='stretch')
+
+
 conn = get_conn()
-tab_today, tab_month = st.tabs(["Today", "Month"])
+tab_today, tab_day, tab_month = st.tabs(["Today", "Day", "Month"])
+
+def pct_delta(current, previous):
+    if current is None or previous in (None, 0):
+        return None
+    return (current - previous) / previous * 100
+
 
 with tab_today:
     live, live_error = fetch_live_snapshot()
@@ -223,19 +377,55 @@ with tab_today:
         st.warning(f"Could not reach the Polycab API for a live reading ({live_error}) - "
                    f"showing historical data only.")
 
+    today_date = datetime.now(IST).date()
+    yesterday = today_date - timedelta(days=1)
+    this_week_start, _ = week_bounds(today_date)
+    last_week_start = this_week_start - timedelta(days=7)
+    last_week_end = this_week_start - timedelta(days=1)
+    this_month_start, _ = month_bounds(today_date)
+    last_month_start, last_month_end = month_bounds(this_month_start - timedelta(days=1))
+
+    kwh_by_date_recent = fetch_daily_kwh(conn, min(last_week_start, last_month_start).isoformat(),
+                                          today_date.isoformat())
+    avg_this_week = avg_kwh_in_range(kwh_by_date_recent, this_week_start, today_date)
+    avg_last_week = avg_kwh_in_range(kwh_by_date_recent, last_week_start, last_week_end)
+    avg_this_month = avg_kwh_in_range(kwh_by_date_recent, this_month_start, today_date)
+    avg_last_month = avg_kwh_in_range(kwh_by_date_recent, last_month_start, last_month_end)
+    week_delta = pct_delta(avg_this_week, avg_last_week)
+    month_delta = pct_delta(avg_this_month, avg_last_month)
+
+    yesterday_kwh = kwh_by_date_recent.get(yesterday.isoformat())
+    today_kwh = live["today_kwh"] if live else None
+    yield_delta = pct_delta(today_kwh, yesterday_kwh)
+
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Current Power", f"{live['power_w']:.0f} W" if live and live["power_w"] is not None else "-")
-    col2.metric("Today's Yield", f"{live['today_kwh']:.2f} kWh" if live and live["today_kwh"] is not None else "-")
+    col2.metric(
+        "Today's Yield",
+        f"{today_kwh:.2f} kWh" if today_kwh is not None else "-",
+        delta=f"{yield_delta:+.0f}% vs yesterday" if yield_delta is not None else None,
+    )
     col3.metric("Status", (live["status"] or "unknown").capitalize() if live else "-")
     col4.metric("Last Update (IST)", live["last_update"] if live else "-")
 
-    today_str_for_sun = datetime.now(IST).date().isoformat()
+    today_str_for_sun = today_date.isoformat()
     sun = {}
     if WEATHER_LAT and WEATHER_LON:
-        _, sun = fetch_hourly_weather_today(WEATHER_LAT, WEATHER_LON, today_str_for_sun)
-    sun_col1, sun_col2 = st.columns(2)
-    sun_col1.metric("Sunrise (IST)", sun.get("sunrise") or "-")
-    sun_col2.metric("Sunset (IST)", sun.get("sunset") or "-")
+        _, sun = fetch_hourly_weather_for_date(WEATHER_LAT, WEATHER_LON, today_str_for_sun)
+
+    row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
+    row2_col1.metric("Sunrise (IST)", sun.get("sunrise") or "-")
+    row2_col2.metric("Sunset (IST)", sun.get("sunset") or "-")
+    row2_col3.metric(
+        "Avg Production This Week",
+        f"{avg_this_week:.2f} kWh/day" if avg_this_week is not None else "-",
+        delta=f"{week_delta:+.0f}% vs last week" if week_delta is not None else None,
+    )
+    row2_col4.metric(
+        "Avg Production This Month",
+        f"{avg_this_month:.2f} kWh/day" if avg_this_month is not None else "-",
+        delta=f"{month_delta:+.0f}% vs last month" if month_delta is not None else None,
+    )
 
     with st.expander("Technical specs"):
         spec_col1, spec_col2 = st.columns(2)
@@ -265,79 +455,44 @@ with tab_today:
     else:
         st.warning("No collector runs recorded yet.")
 
-    st.subheader("Today's production")
-    show_temp = st.checkbox("Overlay ambient temperature", value=False)
+    render_production_section(conn, now_ist.date(), key_prefix="today")
 
-    today = now_ist.date()
-    today_str = today.isoformat()
-    df_today = fetch_today_readings(conn, today_str)
+with tab_day:
+    today = datetime.now(IST).date()
+    selected_date = st.date_input(
+        "Select a date", value=today, min_value=INSTALL_DATE, max_value=today,
+        help=f"Data is only available from the plant's install date, {INSTALL_DATE.isoformat()}, onward.",
+    )
 
-    # Naive (no tzinfo) to match the naive IST wall-clock values in the dataframes above -
-    # see the comment in fetch_today_readings for why.
-    x_start = datetime.combine(today, time(6, 0))
-    x_end = datetime.combine(today, time(19, 0))
-    x_scale = alt.Scale(domain=[x_start.isoformat(), x_end.isoformat()])
+    df_day = fetch_day_readings(conn, selected_date.isoformat())
+    metrics = compute_day_metrics(df_day)
 
-    # Open-Meteo returns the whole day's forecast regardless of current time, so without
-    # clipping to "now" the temperature line would extend into hours that haven't happened
-    # yet - misleading alongside a power line that correctly stops at "now" (or doesn't
-    # exist yet at all, e.g. before sunrise/before the collector's first poll of the day).
-    now_naive = now_ist.replace(tzinfo=None)
-    weather_plot_end = min(x_end, now_naive)
+    dcol1, dcol2, dcol3, dcol4 = st.columns(4)
+    dcol1.metric("Total Production", f"{metrics['total_kwh']:.2f} kWh" if metrics["total_kwh"] is not None else "-")
+    dcol2.metric("Peak Power", f"{metrics['peak_w']:.0f} W at {metrics['peak_time']}"
+                 if metrics["peak_w"] is not None else "-")
+    dcol3.metric("Status", (metrics["status"] or "N/A (backfill only)").capitalize()
+                 if metrics["status"] else "N/A (backfill only)")
+    dcol4.metric("Last Reading (IST)", metrics["last_reading"] or "-")
 
-    power_chart = None
-    if not df_today.empty:
-        power_chart = alt.Chart(df_today).mark_line(color="#f5a623", point=alt.OverlayMarkDef(size=30)).encode(
-            x=alt.X("timestamp_ist:T", title="Time (IST)", scale=x_scale),
-            y=alt.Y("pv_power_w:Q", title="Power (W)"),
-            tooltip=[alt.Tooltip("timestamp_ist:T", title="Time"),
-                     alt.Tooltip("pv_power_w:Q", title="Power (W)"),
-                     alt.Tooltip("source:N", title="Source")],
+    sun = {}
+    if WEATHER_LAT and WEATHER_LON:
+        _, sun = fetch_hourly_weather_for_date(WEATHER_LAT, WEATHER_LON, selected_date.isoformat())
+    day_sun_col1, day_sun_col2 = st.columns(2)
+    day_sun_col1.metric("Sunrise (IST)", sun.get("sunrise") or "-")
+    day_sun_col2.metric("Sunset (IST)", sun.get("sunset") or "-")
+
+    with st.expander("Technical specs"):
+        st.markdown(
+            f"**Inverter model:** {INVERTER_MODEL}  \n"
+            f"**Serial:** {GOODS_ID}  \n"
+            f"**Rated capacity:** 5 kW  \n"
+            f"**Panels:** {PANEL_COUNT} x {PANEL_BRAND} {PANEL_WATTAGE_W}W  \n"
+            f"**Installed capacity:** {INSTALLED_KWP:.2f} kWp  \n"
+            f"**Install date:** {INSTALL_DATE.isoformat()}"
         )
 
-    temp_chart = None
-    if show_temp and WEATHER_LAT and WEATHER_LON and weather_plot_end > x_start:
-        df_weather, _ = fetch_hourly_weather_today(WEATHER_LAT, WEATHER_LON, today_str)
-        df_weather = df_weather[(df_weather["time"] >= x_start) & (df_weather["time"] <= weather_plot_end)]
-        if not df_weather.empty:
-            temp_chart = alt.Chart(df_weather).mark_line(
-                color="#4a90d9", strokeDash=[4, 2], point=alt.OverlayMarkDef(size=30, color="#4a90d9"),
-            ).encode(
-                x=alt.X("time:T", scale=x_scale),
-                y=alt.Y("temperature_c:Q", title="Temp (°C)", scale=alt.Scale(zero=False)),
-                tooltip=[alt.Tooltip("time:T", title="Time"),
-                         alt.Tooltip("temperature_c:Q", title="Temp (°C)")],
-            )
-
-    if power_chart is None and temp_chart is None:
-        st.info("No readings yet for today.")
-    elif power_chart is not None and temp_chart is not None:
-        st.altair_chart(alt.layer(power_chart, temp_chart).resolve_scale(y="independent")
-                         .properties(height=400), width='stretch')
-    else:
-        st.altair_chart((power_chart or temp_chart).properties(height=400), width='stretch')
-
-    if not df_today.empty:
-        st.subheader("Cumulative production today")
-        # Derived by integrating pv_power_w over time (trapezoidal rule) rather than
-        # plotting the DB's own daily_yield_kwh column directly - that field is only ever
-        # populated on `live` rows, which can be sparse (e.g. on a day mostly covered by
-        # backfill), so it wouldn't give a continuous curve. This approximation converges
-        # to roughly the real EToday total by end of day at 5-min sampling resolution.
-        cum_df = df_today.sort_values("timestamp_ist").reset_index(drop=True)
-        dt_hours = cum_df["timestamp_ist"].diff().dt.total_seconds().fillna(0) / 3600
-        power_filled = cum_df["pv_power_w"].fillna(0)
-        avg_power = (power_filled + power_filled.shift(1).fillna(power_filled)) / 2
-        cum_df["cumulative_kwh"] = (dt_hours * avg_power / 1000).cumsum()
-
-        cum_chart = alt.Chart(cum_df).mark_line(color="#2e8b57", point=alt.OverlayMarkDef(size=30, color="#2e8b57")).encode(
-            x=alt.X("timestamp_ist:T", title="Time (IST)", scale=x_scale),
-            y=alt.Y("cumulative_kwh:Q", title="Cumulative energy (kWh)"),
-            tooltip=[alt.Tooltip("timestamp_ist:T", title="Time"),
-                     alt.Tooltip("cumulative_kwh:Q", title="Cumulative kWh", format=".2f"),
-                     alt.Tooltip("source:N", title="Source")],
-        )
-        st.altair_chart(cum_chart.properties(height=300), width='stretch')
+    render_production_section(conn, selected_date, key_prefix="day")
 
 with tab_month:
     st.subheader("Past 12 months")
@@ -371,7 +526,7 @@ with tab_month:
         if not obs_dates:
             continue  # this year isn't part of our lookback window at all
 
-        chart = lesley.cal_heatmap(pd.to_datetime(obs_dates), obs_values, cmap="Oranges",
+        chart = lesley.cal_heatmap(pd.to_datetime(obs_dates), obs_values, cmap="Reds",
                                     days_of_week=["Mon", "Wed", "Fri"], height=260)
         # cal_heatmap only sets padding via a global rectBandPaddingInner (0.1, i.e. shared
         # by both axes) - override it specifically on the day-of-week axis for more
@@ -380,13 +535,28 @@ with tab_month:
 
         # chart.data covers the FULL year (prep_data left-merges onto a Jan1-Dec31 range),
         # so the temperature column has to match that same full-year length/order, not
-        # just the subset of dates passed in above.
+        # just the subset of dates passed in above. Also flag days outside the plant's
+        # actual data period (before install, or future days within this year that
+        # haven't happened yet) - prep_data defaults both to values=0, indistinguishable
+        # from a genuine zero-production day unless we mark them separately.
         temps = []
+        in_valid_period = []
         for d in chart.data["dates"]:
-            w = weather_by_date.get(d.date().isoformat(), {})
+            d_date = d.date()
+            w = weather_by_date.get(d_date.isoformat(), {})
             tmin, tmax = w.get("min"), w.get("max")
             temps.append((tmin + tmax) / 2 if tmin is not None and tmax is not None else None)
+            in_valid_period.append(INSTALL_DATE <= d_date <= today)
         chart.data["avg_temp"] = temps
+        chart.data["in_valid_period"] = in_valid_period
+        chart.encoding.color = alt.condition(
+            "!datum.in_valid_period",
+            alt.value("#ebedf0"),  # grey - before install or a future day not yet happened
+            # bin, not a smooth continuous gradient, to get the visually-stepped
+            # ColorBrewer-style "Reds" look (light -> dark maroon in distinct bands).
+            alt.Color("values:Q", bin=alt.Bin(maxbins=9), scale=alt.Scale(scheme="reds"),
+                      title="kWh", legend=alt.Legend(orient="right")),
+        )
         chart.encoding.tooltip = [
             alt.Tooltip("dates:T", title="Date"),
             alt.Tooltip("values:Q", title="kWh", format=".2f"),
