@@ -60,8 +60,13 @@ if _missing:
     st.stop()
 
 
-@st.cache_resource
 def get_conn():
+    """Deliberately NOT @st.cache_resource: a cached connection gets reused for the
+    entire lifetime of the Streamlit Cloud process (which stays alive for hours/days
+    between visits), and Turso's remote Hrana stream gets torn down server-side after
+    being idle - the client doesn't reconnect automatically, it just fails every query
+    with "stream not found" (seen in production). A fresh connection per script rerun
+    is cheap (this only runs once per rerun, not per query) and avoids that entirely."""
     return libsql.connect(TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
 
 
