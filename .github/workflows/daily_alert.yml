@@ -3,7 +3,7 @@ name: Daily solar summary
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "30 15 * * *"  # 15:30 UTC = 21:00 IST
+    - cron: "30 13 * * *"  # 15:30 UTC = 21:00 IST
 
 jobs:
   alert:
