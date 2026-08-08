@@ -502,6 +502,36 @@ with tab_day:
 with tab_month:
     st.subheader("Past 12 months")
 
+    # lesley's calendar heatmap has a fixed pixel width (52-53 week-columns, sized for
+    # legibility - shrinking it to fit a phone screen would make the cells illegible
+    # rather than actually readable). Neither Streamlit's width="stretch" nor
+    # width="content" nor even passing an explicit int width stopped it from being
+    # squashed to the screen width on mobile - Streamlit's element containers are flex
+    # items, and flex children shrink below their content's natural size by default
+    # regardless of what width the chart itself asks for (a well-known Streamlit/
+    # flexbox gotcha, more fundamental than anything in Vega-Lite's own sizing API).
+    # Fix: disable flex-shrink and force a real min-width on the actual chart wrapper,
+    # so it can't be compressed - then overflow-x: auto on the outer container scrolls
+    # instead, same as GitHub's own contribution graph does on mobile web.
+    HEATMAP_HEIGHT_PX = 260
+    HEATMAP_MIN_WIDTH_PX = HEATMAP_HEIGHT_PX * 5  # matches lesley.cal_heatmap's own internal width formula
+    st.html(f"""<style>
+        div[class*="st-key-heatmap_scroll_"] {{
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            flex-shrink: 0;
+        }}
+        div[class*="st-key-heatmap_scroll_"] * {{
+            flex-shrink: 0;
+        }}
+        div[class*="st-key-heatmap_scroll_"] [data-testid="stVegaLiteChart"] {{
+            min-width: {HEATMAP_MIN_WIDTH_PX}px;
+        }}
+        div[class*="st-key-heatmap_scroll_"] svg {{
+            min-width: {HEATMAP_MIN_WIDTH_PX}px;
+        }}
+    </style>""")
+
     today = datetime.now(IST).date()
     # Clamp to the plant's actual install date - there's nothing meaningful to show before
     # it, and lesley would otherwise render a whole empty 2025 calendar block for no reason.
@@ -532,7 +562,7 @@ with tab_month:
             continue  # this year isn't part of our lookback window at all
 
         chart = lesley.cal_heatmap(pd.to_datetime(obs_dates), obs_values, cmap="Reds",
-                                    days_of_week=["Mon", "Wed", "Fri"], height=260)
+                                    days_of_week=["Mon", "Wed", "Fri"], height=HEATMAP_HEIGHT_PX)
         # cal_heatmap only sets padding via a global rectBandPaddingInner (0.1, i.e. shared
         # by both axes) - override it specifically on the day-of-week axis for more
         # vertical breathing room between rows, without changing the week-to-week spacing.
@@ -567,7 +597,14 @@ with tab_month:
             alt.Tooltip("values:Q", title="kWh", format=".2f"),
             alt.Tooltip("avg_temp:Q", title="Avg temp (°C)", format=".1f"),
         ]
-        st.altair_chart(chart, width="stretch")
+        with st.container(key=f"heatmap_scroll_{year}"):
+            # An explicit int (not "stretch" or "content"): Streamlit's own "content"
+            # mode is documented to still cap at the parent container's width, which is
+            # exactly what was squashing all 53 week-columns into an illegible smear on
+            # mobile - "stretch" has the same effect. Passing the chart's own actual
+            # width bypasses that capping, so it renders at its true fixed size and the
+            # container's overflow-x: auto (above) has real overflow to scroll.
+            st.altair_chart(chart, width=chart.width)
 
     if not any_data:
         st.caption("No production data recorded yet in this range - expected for a plant "
