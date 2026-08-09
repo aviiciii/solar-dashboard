@@ -24,3 +24,22 @@ CREATE TABLE IF NOT EXISTS collector_state (
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     last_attempt TEXT
 );
+
+-- Maintained top-10 producing days, so the dashboard/daily alert can just SELECT
+-- instead of scanning+aggregating `readings` every time. Fully recomputed (not
+-- incrementally patched) by the collector whenever a day's daily_yield_kwh is set or
+-- changes - see collector/collect.py's update_top_days(). Two separate tables (not one
+-- table with a nullable "year" for the all-time scope) to avoid nullable-PK awkwardness.
+CREATE TABLE IF NOT EXISTS top_days_yearly (
+    year INTEGER NOT NULL,
+    rank INTEGER NOT NULL,   -- 1 = best day of that year
+    date TEXT NOT NULL,
+    kwh REAL NOT NULL,
+    PRIMARY KEY (year, rank)
+);
+
+CREATE TABLE IF NOT EXISTS top_days_alltime (
+    rank INTEGER NOT NULL PRIMARY KEY,  -- 1 = best day ever
+    date TEXT NOT NULL,
+    kwh REAL NOT NULL
+);

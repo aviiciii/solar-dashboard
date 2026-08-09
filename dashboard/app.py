@@ -4,6 +4,7 @@ done - never runs 24/7. Read-only against Turso; live snapshot comes from the Po
 directly. See AGENTS.md for the full design rationale.
 """
 
+import base64
 import os
 import sys
 from datetime import date, datetime, time, timedelta
@@ -175,6 +176,20 @@ def fetch_daily_kwh(_conn, start_date_str: str, end_date_str: str) -> dict:
     return {r[0]: r[1] for r in rows}
 
 
+@st.cache_data(ttl=300)
+def fetch_top_days_yearly(_conn, year: int) -> dict:
+    """{date_str: rank} for that year's top 10 - maintained by the collector
+    (update_top_days in collect.py), not recomputed here."""
+    rows = _conn.execute("SELECT date, rank FROM top_days_yearly WHERE year = ?", (year,)).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+@st.cache_data(ttl=300)
+def fetch_top_days_alltime(_conn) -> list[tuple[str, int, float]]:
+    """[(date_str, rank, kwh), ...] ordered by rank - maintained by the collector."""
+    return _conn.execute("SELECT date, rank, kwh FROM top_days_alltime ORDER BY rank").fetchall()
+
+
 def week_bounds(d: date) -> tuple[date, date]:
     """Monday-Sunday bounds of the week containing d (date.weekday(): Monday=0)."""
     monday = d - timedelta(days=d.weekday())
@@ -282,6 +297,70 @@ def fetch_daily_weather_range(lat: str, lon: str, start_date_str: str, end_date_
         if start <= archive_end:
             result.update(_fetch_weather_days(lat, lon, start.isoformat(), archive_end.isoformat(), archive=True))
     return result
+
+
+# Font Awesome Free "star" (this year) and "trophy" (all-time) glyphs, distinct icons so
+# the two badges/heatmap overlays are visually distinguishable at a glance. Encoded as
+# base64 data URIs (not inlined as raw <svg>) because st.html() runs everything through
+# DOMPurify, which strips inline <svg> markup by default - an <img src="data:..."> is
+# always allowed and renders identically. The same data URIs are reused as Vega-Lite
+# mark_image "url" values for the Month tab heatmap overlay below.
+TOP_YEAR_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640">'
+    '<path fill="rgb(255, 212, 59)" d="M341.5 45.1C337.4 37.1 329.1 32 320.1 32'
+    'C311.1 32 302.8 37.1 298.7 45.1L225.1 189.3L65.2 214.7C56.3 216.1 48.9 222.4 46.1 231C43.3 239.6 45.6 249'
+    ' 51.9 255.4L166.3 369.9L141.1 529.8C139.7 538.7 143.4 547.7 150.7 553C158 558.3 167.6 559.1 175.7 555'
+    'L320.1 481.6L464.4 555C472.4 559.1 482.1 558.3 489.4 553C496.7 547.7 500.4 538.8 499 529.8L473.7 369.9'
+    'L588.1 255.4C594.5 249 596.7 239.6 593.9 231C591.1 222.4 583.8 216.1 574.8 214.7L415 189.3L341.5 45.1z"/></svg>'
+)
+TOP_ALLTIME_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640">'
+    '<path fill="rgb(255, 212, 59)" d="M208.3 64L432.3 64C458.8 64 480.4 85.8 '
+    '479.4 112.2C479.2 117.5 479 122.8 478.7 128L528.3 128C554.4 128 577.4 149.6 575.4 177.8C567.9 281.5 514.9 '
+    '338.5 457.4 368.3C441.6 376.5 425.5 382.6 410.2 387.1C390 415.7 369 430.8 352.3 438.9L352.3 512L416.3 '
+    '512C434 512 448.3 526.3 448.3 544C448.3 561.7 434 576 416.3 576L224.3 576C206.6 576 192.3 561.7 192.3 '
+    '544C192.3 526.3 206.6 512 224.3 512L288.3 512L288.3 438.9C272.3 431.2 252.4 416.9 233 390.6C214.6 385.8 '
+    '194.6 378.5 175.1 367.5C121 337.2 72.2 280.1 65.2 177.6C63.3 149.5 86.2 127.9 112.3 127.9L161.9 127.9C161.6 '
+    '122.7 161.4 117.5 161.2 112.1C160.2 85.6 181.8 63.9 208.3 63.9zM165.5 176L113.1 176C119.3 260.7 158.2 303.1 '
+    '198.3 325.6C183.9 288.3 172 239.6 165.5 176zM444 320.8C484.5 297 521.1 254.7 527.3 176L475 176C468.8 236.9 '
+    '457.6 284.2 444 320.8z"/></svg>'
+)
+
+
+def _svg_data_uri(svg: str) -> str:
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+
+
+TOP_YEAR_ICON_URI = _svg_data_uri(TOP_YEAR_ICON_SVG)
+TOP_ALLTIME_ICON_URI = _svg_data_uri(TOP_ALLTIME_ICON_SVG)
+
+TOP_BADGE_STYLE = (
+    "display:inline-flex;align-items:center;gap:6px;background:#fff8e1;border:1px solid #ffe082;"
+    "border-radius:16px;padding:4px 12px;margin-right:8px;margin-bottom:8px;font-size:0.85rem;color:#5c4a00;"
+)
+
+
+def render_top_days_banner(conn, selected_date: date) -> None:
+    """Shown on both the Today and Day tabs - one badge per list (yearly / all-time)
+    the viewed date ranks in (maintained by the collector), each with its own icon."""
+    date_str = selected_date.isoformat()
+    yearly_rank = fetch_top_days_yearly(conn, selected_date.year).get(date_str)
+    alltime_rank = next((r for d, r, _ in fetch_top_days_alltime(conn) if d == date_str), None)
+
+    if yearly_rank is None and alltime_rank is None:
+        return
+    badges = []
+    if yearly_rank is not None:
+        badges.append(
+            f'<div style="{TOP_BADGE_STYLE}"><img src="{TOP_YEAR_ICON_URI}" width="16" height="16"> '
+            f'#{yearly_rank} this year</div>'
+        )
+    if alltime_rank is not None:
+        badges.append(
+            f'<div style="{TOP_BADGE_STYLE}"><img src="{TOP_ALLTIME_ICON_URI}" width="16" height="16"> '
+            f'#{alltime_rank} all-time</div>'
+        )
+    st.html(f'<div style="display:flex;flex-wrap:wrap;">{"".join(badges)}</div>')
 
 
 def render_production_section(conn, selected_date: date, key_prefix: str) -> None:
@@ -460,6 +539,7 @@ with tab_today:
     else:
         st.warning("No collector runs recorded yet.")
 
+    render_top_days_banner(conn, now_ist.date())
     render_production_section(conn, now_ist.date(), key_prefix="today")
 
 with tab_day:
@@ -483,9 +563,37 @@ with tab_day:
     sun = {}
     if WEATHER_LAT and WEATHER_LON:
         _, sun = fetch_hourly_weather_for_date(WEATHER_LAT, WEATHER_LON, selected_date.isoformat())
-    day_sun_col1, day_sun_col2 = st.columns(2)
+
+    day_week_start, day_week_end = week_bounds(selected_date)
+    day_last_week_start = day_week_start - timedelta(days=7)
+    day_last_week_end = day_week_start - timedelta(days=1)
+    day_month_start, day_month_end = month_bounds(selected_date)
+    day_last_month_start, day_last_month_end = month_bounds(day_month_start - timedelta(days=1))
+
+    kwh_by_date_day = fetch_daily_kwh(
+        conn, min(day_last_week_start, day_last_month_start).isoformat(),
+        min(max(day_week_end, day_month_end), today).isoformat(),
+    )
+    avg_day_week = avg_kwh_in_range(kwh_by_date_day, day_week_start, min(day_week_end, today))
+    avg_day_last_week = avg_kwh_in_range(kwh_by_date_day, day_last_week_start, day_last_week_end)
+    avg_day_month = avg_kwh_in_range(kwh_by_date_day, day_month_start, min(day_month_end, today))
+    avg_day_last_month = avg_kwh_in_range(kwh_by_date_day, day_last_month_start, day_last_month_end)
+    day_week_delta = pct_delta(avg_day_week, avg_day_last_week)
+    day_month_delta = pct_delta(avg_day_month, avg_day_last_month)
+
+    day_sun_col1, day_sun_col2, day_sun_col3, day_sun_col4 = st.columns(4)
     day_sun_col1.metric("Sunrise (IST)", sun.get("sunrise") or "-")
     day_sun_col2.metric("Sunset (IST)", sun.get("sunset") or "-")
+    day_sun_col3.metric(
+        "Avg Production This Week",
+        f"{avg_day_week:.2f} kWh/day" if avg_day_week is not None else "-",
+        delta=f"{day_week_delta:+.0f}% vs last week" if day_week_delta is not None else None,
+    )
+    day_sun_col4.metric(
+        "Avg Production This Month",
+        f"{avg_day_month:.2f} kWh/day" if avg_day_month is not None else "-",
+        delta=f"{day_month_delta:+.0f}% vs last month" if day_month_delta is not None else None,
+    )
 
     with st.expander("Technical specs"):
         st.markdown(
@@ -497,6 +605,7 @@ with tab_day:
             f"**Install date:** {INSTALL_DATE.isoformat()}"
         )
 
+    render_top_days_banner(conn, selected_date)
     render_production_section(conn, selected_date, key_prefix="day")
 
 with tab_month:
@@ -592,11 +701,48 @@ with tab_month:
             alt.Color("values:Q", bin=alt.Bin(maxbins=9), scale=alt.Scale(scheme="reds"),
                       title="kWh", legend=alt.Legend(orient="right")),
         )
+        top_rank_by_date = fetch_top_days_yearly(conn, year)
+        alltime_rank_by_date = {d: r for d, r, _ in fetch_top_days_alltime(conn)}
+        top_rank_col = [top_rank_by_date.get(d.date().isoformat()) for d in chart.data["dates"]]
+        alltime_rank_col = [alltime_rank_by_date.get(d.date().isoformat()) for d in chart.data["dates"]]
+        # All-time icon takes priority over the yearly icon when a day is in both lists,
+        # per the requested overlay behavior - a day can only show one glyph per cell.
+        # Computed from these plain Python lists (not chart.data's columns) because
+        # assigning a list containing None onto a pandas column silently upcasts it to
+        # float64 with NaN in place of None - and `NaN is not None` is True, which would
+        # make every single day (including grey non-data days) match the "has a rank"
+        # branch below.
+        top_icon_col = [
+            TOP_ALLTIME_ICON_URI if a is not None else (TOP_YEAR_ICON_URI if y is not None else None)
+            for a, y in zip(alltime_rank_col, top_rank_col)
+        ]
+        chart.data["top_rank"] = top_rank_col
+        chart.data["alltime_rank"] = alltime_rank_col
+        chart.data["top_icon_url"] = top_icon_col
+
         chart.encoding.tooltip = [
             alt.Tooltip("dates:T", title="Date"),
             alt.Tooltip("values:Q", title="kWh", format=".2f"),
             alt.Tooltip("avg_temp:Q", title="Avg temp (°C)", format=".1f"),
+            alt.Tooltip("top_rank:O", title="Top 10 rank (this year)"),
+            alt.Tooltip("alltime_rank:O", title="Top 10 rank (all-time)"),
         ]
+
+        # Icon overlay for top-10 days - reuses the exact same x/y encoding objects as
+        # the rect layer so the glyph aligns with the right cell, and the same tooltip
+        # so hovering the (small) icon itself still shows the full info. mark_image (not
+        # mark_text) since these are the actual FontAwesome SVGs, not emoji glyphs.
+        sun_layer = alt.Chart(chart.data).mark_image(width=12, height=12).encode(
+            x=chart.encoding.x, y=chart.encoding.y, url="top_icon_url:N", tooltip=chart.encoding.tooltip,
+        ).transform_filter("datum.top_icon_url != null")
+        # lesley's chart sets a top-level .config (via its own .configure_*() calls),
+        # which Altair refuses inside a LayerChart's sub-charts ("Objects with 'config'
+        # attribute cannot be used within LayerChart") - move it to the outer layer.
+        chart_config = chart.config
+        chart.config = alt.Undefined
+        chart = alt.layer(chart, sun_layer)
+        chart.config = chart_config
+
         with st.container(key=f"heatmap_scroll_{year}"):
             # An explicit int (not "stretch" or "content"): Streamlit's own "content"
             # mode is documented to still cap at the parent container's width, which is
@@ -604,8 +750,18 @@ with tab_month:
             # mobile - "stretch" has the same effect. Passing the chart's own actual
             # width bypasses that capping, so it renders at its true fixed size and the
             # container's overflow-x: auto (above) has real overflow to scroll.
-            st.altair_chart(chart, width=chart.width)
+            st.altair_chart(chart, width=HEATMAP_MIN_WIDTH_PX)
 
     if not any_data:
         st.caption("No production data recorded yet in this range - expected for a plant "
                    f"that went live on {INSTALL_DATE.isoformat()}, this will fill in over time.")
+
+    st.subheader("🏆 All-time top 10")
+    alltime = fetch_top_days_alltime(conn)
+    if alltime:
+        st.dataframe(
+            pd.DataFrame(alltime, columns=["Date", "Rank", "kWh"]).set_index("Rank"),
+            width="stretch",
+        )
+    else:
+        st.caption("No production data recorded yet.")

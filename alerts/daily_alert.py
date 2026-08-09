@@ -85,6 +85,17 @@ def find_daylight_gaps(conn, today: date, stale_minutes: int) -> list[tuple[str,
     return gaps
 
 
+def top_day_ranks(conn, today: date) -> tuple[int | None, int | None]:
+    """(yearly_rank, alltime_rank) if today made either top-10 list, maintained by
+    the collector (update_top_days in collect.py) - this is what surfaces "a new day
+    tops the list", since this script only runs once/day and only describes today."""
+    date_str = today.isoformat()
+    yearly = conn.execute("SELECT rank FROM top_days_yearly WHERE year = ? AND date = ?",
+                           (today.year, date_str)).fetchone()
+    alltime = conn.execute("SELECT rank FROM top_days_alltime WHERE date = ?", (date_str,)).fetchone()
+    return (yearly[0] if yearly else None, alltime[0] if alltime else None)
+
+
 def fetch_weather(lat: str, lon: str, today: date) -> dict | None:
     try:
         resp = requests.get(
@@ -120,8 +131,17 @@ def pct_change(new: float | None, baseline: float | None) -> float | None:
 
 
 def build_message(today: date, today_kwh, yesterday_kwh, avg7_kwh, peak_kw, peak_time,
-                   gaps: list[tuple[str, str]], weather: dict | None) -> str:
+                   gaps: list[tuple[str, str]], weather: dict | None,
+                   yearly_rank: int | None, alltime_rank: int | None) -> str:
     lines = [f"Solar summary for {today.isoformat()}"]
+
+    if yearly_rank is not None or alltime_rank is not None:
+        parts = []
+        if yearly_rank is not None:
+            parts.append(f"#{yearly_rank} this year")
+        if alltime_rank is not None and alltime_rank != yearly_rank:
+            parts.append(f"#{alltime_rank} all-time")
+        lines.append(f"🏆 Top production day - ranks {' and '.join(parts)}!")
 
     if today_kwh is not None:
         lines.append(f"Total production: {today_kwh:.2f} kWh")
@@ -185,12 +205,13 @@ def main() -> int:
 
         conn = libsql.connect(turso_url, auth_token=turso_token)
         gaps = find_daylight_gaps(conn, today, stale_minutes)
+        yearly_rank, alltime_rank = top_day_ranks(conn, today)
         conn.close()
 
         weather = fetch_weather(weather_lat, weather_lon, today) if weather_lat and weather_lon else None
 
         message = build_message(today, today_kwh, yesterday_kwh, avg7_kwh, peak_kw, peak_time,
-                                 gaps, weather)
+                                 gaps, weather, yearly_rank, alltime_rank)
         logging.info("sending notification:\n%s", message)
         send_ntfy(ntfy_topic, message, title="Solar daily summary")
         logging.info("notification sent ok")

@@ -171,6 +171,45 @@ def insert_rows(conn, rows: list[dict]) -> int:
     return cur.rowcount
 
 
+def update_top_days(conn, date_str: str) -> None:
+    """Fully recomputes both the affected year's top-10 and the all-time top-10
+    whenever a day's daily_yield_kwh might have changed (a live poll or a backfill's
+    day-total fix). Cheap full recompute rather than an incremental patch - a home
+    system accumulates at most a few hundred rows/year, and this sidesteps edge cases
+    like a backfill correcting an earlier day's total after it was already ranked.
+
+    Grouping by substr(timestamp,1,10)/1,4) (UTC date/year) rather than parsing
+    dates in Python: our daylight-only collection window never crosses UTC midnight
+    for a given IST day, so UTC-date == IST-date here - see fetch_daily_kwh in
+    dashboard/app.py, which relies on the same fact."""
+    year = date.fromisoformat(date_str).year
+
+    yearly_rows = conn.execute(
+        "SELECT substr(timestamp, 1, 10) AS d, MAX(daily_yield_kwh) AS kwh FROM readings "
+        "WHERE substr(timestamp, 1, 4) = ? AND daily_yield_kwh IS NOT NULL "
+        "GROUP BY d ORDER BY kwh DESC LIMIT 10",
+        (f"{year:04d}",),
+    ).fetchall()
+    conn.execute("DELETE FROM top_days_yearly WHERE year = ?", (year,))
+    if yearly_rows:
+        conn.executemany(
+            "INSERT INTO top_days_yearly (year, rank, date, kwh) VALUES (?, ?, ?, ?)",
+            [(year, i + 1, d, k) for i, (d, k) in enumerate(yearly_rows)],
+        )
+
+    alltime_rows = conn.execute(
+        "SELECT substr(timestamp, 1, 10) AS d, MAX(daily_yield_kwh) AS kwh FROM readings "
+        "WHERE daily_yield_kwh IS NOT NULL GROUP BY d ORDER BY kwh DESC LIMIT 10",
+    ).fetchall()
+    conn.execute("DELETE FROM top_days_alltime")
+    if alltime_rows:
+        conn.executemany(
+            "INSERT INTO top_days_alltime (rank, date, kwh) VALUES (?, ?, ?)",
+            [(i + 1, d, k) for i, (d, k) in enumerate(alltime_rows)],
+        )
+    conn.commit()
+
+
 def dates_needing_backfill(conn, backfill_start: date | None, stale_minutes: int,
                             max_days: int) -> list[str]:
     today_local = datetime.now(IST).date()
@@ -283,6 +322,8 @@ def main() -> int:
             rows = fetch_backfill_day(day, member_auto_id, token, monthly_yields)
             inserted = insert_rows(conn, rows)
             logging.info("backfill %s: %d rows inserted (%d returned)", day, inserted, len(rows))
+            if rows and rows[-1]["daily_yield_kwh"] is not None:
+                update_top_days(conn, day)
 
         live_row = fetch_live_reading(goods_id, member_auto_id, token)
         inserted = insert_rows(conn, [live_row])
@@ -291,6 +332,8 @@ def main() -> int:
             live_row["timestamp"], live_row["pv_power_w"], live_row["daily_yield_kwh"],
             live_row["total_yield_kwh"], live_row["status"], "inserted" if inserted else "already had it",
         )
+        if live_row["daily_yield_kwh"] is not None:
+            update_top_days(conn, live_row["timestamp"][:10])
         state["consecutive_failures"] = 0
         save_backoff_state(conn, state)
         return 0
