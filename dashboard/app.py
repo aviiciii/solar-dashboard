@@ -135,6 +135,76 @@ def fetch_day_readings(_conn, date_str: str) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=60)
+def fetch_week_readings(_conn, week_start_str: str, week_end_str: str) -> pd.DataFrame:
+    """All readings in [week_start, week_end] (inclusive) - a superset query used to
+    build the "average this week" overlay lines, keyed by each row's calendar date and
+    5-min-floored time-of-day so per-day curves can be grouped and averaged bucket-by-
+    bucket. 5-min floor matches the collector's actual polling cadence (see AGENTS.md),
+    so it buckets same-time-of-day readings across days without needing exact alignment."""
+    week_start, week_end = date.fromisoformat(week_start_str), date.fromisoformat(week_end_str)
+    start_utc = datetime.combine(week_start, time.min, IST).astimezone(UTC)
+    end_utc = datetime.combine(week_end + timedelta(days=1), time.min, IST).astimezone(UTC)
+    rows = _conn.execute(
+        "SELECT timestamp, pv_power_w FROM readings WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+        (start_utc.isoformat(), end_utc.isoformat()),
+    ).fetchall()
+    df = pd.DataFrame(rows, columns=["timestamp_utc", "pv_power_w"])
+    if not df.empty:
+        df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+        df["timestamp_ist"] = df["timestamp_utc"].dt.tz_convert(IST).dt.tz_localize(None)
+        df["date"] = df["timestamp_ist"].dt.date
+        df["time_of_day"] = df["timestamp_ist"].dt.floor("5min").dt.time
+    return df
+
+
+def add_cumulative_kwh(df: pd.DataFrame) -> pd.DataFrame:
+    """Trapezoidal-rule integration of pv_power_w over time -> cumulative_kwh column.
+    `df` must already be sorted by timestamp_ist. Shared by the main cumulative chart
+    and the per-day curves behind the "average this week" overlay, so the same
+    approximation is used consistently rather than duplicated in two places."""
+    df = df.copy()
+    dt_hours = df["timestamp_ist"].diff().dt.total_seconds().fillna(0) / 3600
+    power_filled = df["pv_power_w"].fillna(0)
+    avg_power = (power_filled + power_filled.shift(1).fillna(power_filled)) / 2
+    df["cumulative_kwh"] = (dt_hours * avg_power / 1000).cumsum()
+    return df
+
+
+def compute_week_avg_power(df_week: pd.DataFrame, overlay_date: date) -> pd.DataFrame:
+    """Average pv_power_w per time-of-day bucket across every day present in df_week,
+    replotted onto `overlay_date` so it lines up on the same x-axis as that day's chart."""
+    if df_week.empty:
+        return pd.DataFrame(columns=["timestamp_ist", "avg_power_w"])
+    # Collapse to one value per (date, bucket) first - live and backfill rows can both
+    # land in the same 5-min bucket on a given day, and without this a day with more
+    # such duplicates would silently outweigh other days in the across-day average.
+    per_day_bucket = df_week.groupby(["date", "time_of_day"], as_index=False)["pv_power_w"].mean()
+    grouped = per_day_bucket.groupby("time_of_day", as_index=False)["pv_power_w"].mean() \
+                             .rename(columns={"pv_power_w": "avg_power_w"})
+    grouped["timestamp_ist"] = grouped["time_of_day"].apply(lambda t: datetime.combine(overlay_date, t))
+    return grouped[["timestamp_ist", "avg_power_w"]]
+
+
+def compute_week_avg_cumulative(df_week: pd.DataFrame, overlay_date: date) -> pd.DataFrame:
+    """Per-day cumulative-kWh curves (same integration as the main chart) for every day
+    in df_week, then averaged per time-of-day bucket and replotted onto `overlay_date`."""
+    if df_week.empty:
+        return pd.DataFrame(columns=["timestamp_ist", "avg_cum_kwh"])
+    per_day_cum = []
+    for _, day_df in df_week.groupby("date"):
+        day_df = add_cumulative_kwh(day_df.sort_values("timestamp_ist").reset_index(drop=True))
+        # Collapse duplicate same-bucket rows within this day to their max (cumulative
+        # is monotonic, so the max in a bucket is the latest/true value as of that
+        # time-of-day) before pooling across days - same reasoning as compute_week_avg_power.
+        collapsed = day_df.groupby("time_of_day", as_index=False)["cumulative_kwh"].max()
+        per_day_cum.append(collapsed)
+    grouped = pd.concat(per_day_cum).groupby("time_of_day", as_index=False)["cumulative_kwh"].mean() \
+                                     .rename(columns={"cumulative_kwh": "avg_cum_kwh"})
+    grouped["timestamp_ist"] = grouped["time_of_day"].apply(lambda t: datetime.combine(overlay_date, t))
+    return grouped[["timestamp_ist", "avg_cum_kwh"]]
+
+
 def compute_day_metrics(df: pd.DataFrame) -> dict:
     """Everything here comes straight from our own DB (not the live API) - this is what
     powers the Day tab's metrics for an arbitrary (including past) date."""
@@ -391,6 +461,18 @@ def render_production_section(conn, selected_date: date, key_prefix: str) -> Non
     else:
         weather_plot_end = x_end  # the whole day has already happened, no "future" to clip
 
+    # "Average this week" overlay data - the week (Mon-Sun) containing selected_date,
+    # capped at today since future days have no readings yet. Computed once here and
+    # reused by both the power and cumulative charts below. Restricted to the same
+    # timestamp range as selected_date's own data (not the full day) per the request to
+    # overlay the average "during the data points" - a day with only a few readings so
+    # far shouldn't get an average line stretching across hours that haven't happened.
+    df_week = pd.DataFrame()
+    if not df.empty:
+        week_start, week_end = week_bounds(selected_date)
+        df_week = fetch_week_readings(conn, week_start.isoformat(), min(week_end, today).isoformat())
+        t_min, t_max = df["timestamp_ist"].min(), df["timestamp_ist"].max()
+
     power_chart = None
     if not df.empty:
         power_chart = alt.Chart(df).mark_line(color="#f5a623", point=alt.OverlayMarkDef(size=30)).encode(
@@ -400,6 +482,20 @@ def render_production_section(conn, selected_date: date, key_prefix: str) -> Non
                      alt.Tooltip("pv_power_w:Q", title="Power (W)"),
                      alt.Tooltip("source:N", title="Source")],
         )
+
+    avg_power_chart = None
+    if not df_week.empty:
+        avg_power_df = compute_week_avg_power(df_week, selected_date)
+        avg_power_df = avg_power_df[(avg_power_df["timestamp_ist"] >= t_min) & (avg_power_df["timestamp_ist"] <= t_max)]
+        if not avg_power_df.empty:
+            avg_power_chart = alt.Chart(avg_power_df).mark_line(
+                color="#888888", strokeDash=[4, 3], strokeWidth=1.5,
+            ).encode(
+                x=alt.X("timestamp_ist:T", scale=x_scale),
+                y=alt.Y("avg_power_w:Q"),
+                tooltip=[alt.Tooltip("timestamp_ist:T", title="Time"),
+                         alt.Tooltip("avg_power_w:Q", title="Week avg power (W)", format=".0f")],
+            )
 
     temp_chart = None
     if show_temp and WEATHER_LAT and WEATHER_LON and weather_plot_end > x_start:
@@ -415,13 +511,21 @@ def render_production_section(conn, selected_date: date, key_prefix: str) -> Non
                          alt.Tooltip("temperature_c:Q", title="Temp (°C)")],
             )
 
-    if power_chart is None and temp_chart is None:
+    # power_chart + avg_power_chart share the primary y-axis (directly comparable W
+    # values), so they're layered together first; temp_chart then layers on top with its
+    # own independent y-axis, since °C isn't on the same scale as W.
+    main_layers = [c for c in (power_chart, avg_power_chart) if c is not None]
+    main_chart = alt.layer(*main_layers) if len(main_layers) > 1 else (main_layers[0] if main_layers else None)
+
+    if main_chart is None and temp_chart is None:
         st.info("No readings yet for today." if is_today else "No readings recorded for this day.")
-    elif power_chart is not None and temp_chart is not None:
-        st.altair_chart(alt.layer(power_chart, temp_chart).resolve_scale(y="independent")
+    elif main_chart is not None and temp_chart is not None:
+        st.altair_chart(alt.layer(main_chart, temp_chart).resolve_scale(y="independent")
                          .properties(height=400), width='stretch')
     else:
-        st.altair_chart((power_chart or temp_chart).properties(height=400), width='stretch')
+        st.altair_chart((main_chart or temp_chart).properties(height=400), width='stretch')
+    if avg_power_chart is not None:
+        st.caption("┄┄ Average power at the same time of day, across this week")
 
     if not df.empty:
         st.subheader("Cumulative production today" if is_today else "Cumulative production")
@@ -430,11 +534,7 @@ def render_production_section(conn, selected_date: date, key_prefix: str) -> Non
         # populated on `live` rows, which can be sparse (e.g. on a day mostly covered by
         # backfill), so it wouldn't give a continuous curve. This approximation converges
         # to roughly the real EToday total by end of day at 5-min sampling resolution.
-        cum_df = df.sort_values("timestamp_ist").reset_index(drop=True)
-        dt_hours = cum_df["timestamp_ist"].diff().dt.total_seconds().fillna(0) / 3600
-        power_filled = cum_df["pv_power_w"].fillna(0)
-        avg_power = (power_filled + power_filled.shift(1).fillna(power_filled)) / 2
-        cum_df["cumulative_kwh"] = (dt_hours * avg_power / 1000).cumsum()
+        cum_df = add_cumulative_kwh(df.sort_values("timestamp_ist").reset_index(drop=True))
 
         cum_chart = alt.Chart(cum_df).mark_line(color="#2e8b57", point=alt.OverlayMarkDef(size=30, color="#2e8b57")).encode(
             x=alt.X("timestamp_ist:T", title="Time (IST)", scale=x_scale),
@@ -443,7 +543,27 @@ def render_production_section(conn, selected_date: date, key_prefix: str) -> Non
                      alt.Tooltip("cumulative_kwh:Q", title="Cumulative kWh", format=".2f"),
                      alt.Tooltip("source:N", title="Source")],
         )
-        st.altair_chart(cum_chart.properties(height=300), width='stretch')
+
+        cum_layers = [cum_chart]
+        has_avg_cum = False
+        if not df_week.empty:
+            avg_cum_df = compute_week_avg_cumulative(df_week, selected_date)
+            avg_cum_df = avg_cum_df[(avg_cum_df["timestamp_ist"] >= t_min) & (avg_cum_df["timestamp_ist"] <= t_max)]
+            if not avg_cum_df.empty:
+                cum_layers.append(alt.Chart(avg_cum_df).mark_line(
+                    color="#888888", strokeDash=[4, 3], strokeWidth=1.5,
+                ).encode(
+                    x=alt.X("timestamp_ist:T", scale=x_scale),
+                    y=alt.Y("avg_cum_kwh:Q"),
+                    tooltip=[alt.Tooltip("timestamp_ist:T", title="Time"),
+                             alt.Tooltip("avg_cum_kwh:Q", title="Week avg cumulative (kWh)", format=".2f")],
+                ))
+                has_avg_cum = True
+
+        final_cum_chart = alt.layer(*cum_layers) if len(cum_layers) > 1 else cum_layers[0]
+        st.altair_chart(final_cum_chart.properties(height=300), width='stretch')
+        if has_avg_cum:
+            st.caption("┄┄ Average cumulative energy at the same time of day, across this week")
 
 
 conn = get_conn()
