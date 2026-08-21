@@ -112,6 +112,24 @@ def fetch_live_reading(goods_id: str, member_auto_id: str, token: str) -> dict:
     }
 
 
+def integrate_kwh(rows: list[dict]) -> float:
+    """Trapezoidal-rule integration of a chronological list of backfill row dicts'
+    pv_power_w over time -> total kWh. Used as a fallback day total (see
+    fetch_backfill_day) - same approximation as dashboard/app.py's add_cumulative_kwh,
+    just operating on row dicts instead of a DataFrame since that's what this module
+    works with before insertion."""
+    total_kwh = 0.0
+    prev_dt, prev_w = None, None
+    for row in rows:
+        dt = datetime.fromisoformat(row["timestamp"])
+        w = row["pv_power_w"] or 0
+        if prev_dt is not None:
+            hours = (dt - prev_dt).total_seconds() / 3600
+            total_kwh += hours * (w + prev_w) / 2 / 1000
+        prev_dt, prev_w = dt, w
+    return total_kwh
+
+
 def fetch_backfill_day(date_str: str, member_auto_id: str, token: str, monthly_yields: MonthlyYields) -> list[dict]:
     """date_str is a local (IST) calendar date 'YYYY-MM-DD'. The day-curve endpoint
     (getAllPacDay_v1) only ever gives instantaneous power, never the finer electrical
@@ -144,6 +162,15 @@ def fetch_backfill_day(date_str: str, member_auto_id: str, token: str, monthly_y
 
     if rows:
         day_total = monthly_yields.yield_for(date.fromisoformat(date_str))
+        # getAllPacMonth's total is derived from the device's own last-reported EToday
+        # for that day - if the device was disconnected near end-of-day (e.g. the exact
+        # outage this backfill is meant to fix), the portal never got a final EToday and
+        # reports 0 indefinitely, even though the day-curve endpoint above clearly shows
+        # real production. Fall back to integrating our own power curve rather than
+        # trusting a portal total that contradicts the data we just fetched.
+        has_production = any(row["pv_power_w"] for row in rows)
+        if (day_total is None or day_total == 0) and has_production:
+            day_total = integrate_kwh(rows)
         if day_total is not None:
             rows[-1]["daily_yield_kwh"] = day_total  # rows are chronological; last = latest
 

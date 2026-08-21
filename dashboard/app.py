@@ -21,7 +21,12 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from polycab_client import AuthError, NetworkError, SchemaError, call, num  # noqa: E402
+from polycab_client import AuthError, NetworkError, SchemaError, MonthlyYields, call, num  # noqa: E402
+# collector/ has no __init__.py, so this is imported as a bare module via sys.path, not
+# a package - reuses the collector's own backfill/ranking logic rather than duplicating
+# it for the Admin tab's manual re-backfill capability.
+sys.path.insert(0, str(PROJECT_ROOT / "collector"))
+from collect import fetch_backfill_day, insert_rows, update_top_days  # noqa: E402
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -39,6 +44,8 @@ TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL", "").strip()
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
 WEATHER_LAT = os.environ.get("WEATHER_LAT", "").strip()
 WEATHER_LON = os.environ.get("WEATHER_LON", "").strip()
+# Unset by default -> the Admin tab stays fully disabled (not "no password required").
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
 
 # Static specs - not available from the Polycab API.
 PANEL_COUNT = 5
@@ -566,8 +573,69 @@ def render_production_section(conn, selected_date: date, key_prefix: str) -> Non
             st.caption("┄┄ Average cumulative energy at the same time of day, across this week")
 
 
+def run_admin_backfill(conn, backfill_date: date) -> tuple[bool, str]:
+    """Force re-backfill of a single day - used by the Admin tab to fix a day whose
+    readings were corrupted by an internet/inverter outage (e.g. stuck at 0 W).
+    Unlike the collector's normal run, this targets a day that may already have rows,
+    so those rows must be deleted before re-inserting (insert_rows is INSERT OR IGNORE
+    keyed on timestamp - it silently no-ops on a day that already has rows otherwise).
+
+    Fetches from the Polycab API BEFORE deleting anything, so a failed/empty API
+    response never leaves the day worse off than it started."""
+    date_str = backfill_date.isoformat()
+    monthly_yields = MonthlyYields(MEMBER_AUTO_ID, POLYCAB_TOKEN)
+    try:
+        rows = fetch_backfill_day(date_str, MEMBER_AUTO_ID, POLYCAB_TOKEN, monthly_yields)
+    except (AuthError, NetworkError, SchemaError) as e:
+        return False, f"Could not fetch replacement data: {e}"
+
+    if not rows:
+        return False, (f"The Polycab API returned no data for {date_str} - nothing to "
+                        f"backfill. Existing rows were left unchanged.")
+
+    day_start_utc = datetime.combine(backfill_date, time.min, IST).astimezone(UTC)
+    day_end_utc = day_start_utc + timedelta(days=1)
+    try:
+        conn.execute("DELETE FROM readings WHERE timestamp >= ? AND timestamp < ?",
+                     (day_start_utc.isoformat(), day_end_utc.isoformat()))
+        inserted = insert_rows(conn, rows)
+        update_top_days(conn, date_str)
+    except Exception as e:  # noqa: BLE001 - must not leave a committed delete with no insert
+        conn.rollback()
+        return False, f"Backfill failed while writing to the database - rolled back, no partial changes made ({e})."
+
+    # Stale-cache guard: every cached fetch that could include this date needs to be
+    # invalidated so the other tabs reflect the fix immediately, not after ttl expiry.
+    fetch_day_readings.clear()
+    fetch_daily_kwh.clear()
+    fetch_week_readings.clear()
+    fetch_top_days_yearly.clear()
+    fetch_top_days_alltime.clear()
+    return True, f"Re-backfilled {date_str}: {inserted} row(s) inserted, rankings recomputed."
+
+
+@st.dialog("Confirm re-backfill")
+def confirm_backfill_dialog(conn, backfill_date: date) -> None:
+    date_str = backfill_date.isoformat()
+    day_start_utc = datetime.combine(backfill_date, time.min, IST).astimezone(UTC)
+    day_end_utc = day_start_utc + timedelta(days=1)
+    existing_count = conn.execute(
+        "SELECT COUNT(*) FROM readings WHERE timestamp >= ? AND timestamp < ?",
+        (day_start_utc.isoformat(), day_end_utc.isoformat()),
+    ).fetchone()[0]
+    st.warning(f"This will delete {existing_count} existing reading(s) for {date_str} "
+               f"and re-fetch fresh data from the Polycab API.")
+    confirm_col, cancel_col = st.columns(2)
+    if confirm_col.button(f"Yes, re-backfill {date_str}", key="admin_confirm_yes"):
+        with st.spinner(f"Re-fetching {date_str} from the Polycab API..."):
+            success, message = run_admin_backfill(conn, backfill_date)
+        (st.success if success else st.error)(message)
+    if cancel_col.button("Cancel", key="admin_confirm_no"):
+        st.rerun()
+
+
 conn = get_conn()
-tab_today, tab_day, tab_month = st.tabs(["Today", "Day", "Month"])
+tab_today, tab_day, tab_month, tab_admin = st.tabs(["Today", "Day", "Month", "Admin"])
 
 def pct_delta(current, previous):
     if current is None or previous in (None, 0):
@@ -885,3 +953,38 @@ with tab_month:
         )
     else:
         st.caption("No production data recorded yet.")
+
+with tab_admin:
+    st.subheader("Admin")
+
+    if not ADMIN_PASSWORD:
+        st.info("Admin features are disabled - set ADMIN_PASSWORD in .env to enable.")
+    else:
+        st.session_state.setdefault("admin_authed", False)
+
+        if not st.session_state["admin_authed"]:
+            admin_pw = st.text_input("Admin password", type="password", key="admin_pw_input")
+            if st.button("Log in", key="admin_login_btn"):
+                if admin_pw == ADMIN_PASSWORD:
+                    st.session_state["admin_authed"] = True
+                    st.rerun()
+                else:
+                    st.error("Incorrect password.")
+        else:
+            if st.button("Log out", key="admin_logout_btn"):
+                st.session_state["admin_authed"] = False
+                st.rerun()
+
+            st.markdown("#### Re-backfill a day")
+            st.caption("Deletes and re-fetches all readings for a chosen date from the Polycab "
+                       "API - use this after an internet/inverter outage left bad readings "
+                       "(e.g. stuck at 0 W) for that day, once connectivity is restored.")
+
+            admin_today = datetime.now(IST).date()
+            admin_backfill_date = st.date_input(
+                "Date to re-backfill", value=admin_today - timedelta(days=1),
+                min_value=INSTALL_DATE, max_value=admin_today, key="admin_backfill_date",
+            )
+
+            if st.button("Re-backfill this date", key="admin_backfill_btn"):
+                confirm_backfill_dialog(conn, admin_backfill_date)
