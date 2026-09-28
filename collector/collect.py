@@ -198,24 +198,41 @@ def insert_rows(conn, rows: list[dict]) -> int:
     return cur.rowcount
 
 
+def record_daily_total(conn, date_str: str, kwh: float, overwrite: bool = False) -> bool:
+    """Upserts one day's total into daily_totals and reports whether it actually
+    changed - callers skip update_top_days() when it didn't (e.g. an idle overnight
+    poll re-reporting the same EToday), which is most of the collector's read savings.
+
+    Default mode only ever raises a day's total (`MAX` semantics, same as the old
+    `MAX(daily_yield_kwh)` aggregation over `readings`), and the conditional DO UPDATE
+    is atomic, so it's safe under collect.yml's deliberately-overlapping segments.
+    `overwrite=True` is for the Admin tab's re-backfill, which can legitimately lower a
+    day's total when replacing corrupted readings."""
+    condition = "excluded.kwh IS NOT daily_totals.kwh" if overwrite else "excluded.kwh > daily_totals.kwh"
+    cur = conn.execute(
+        f"INSERT INTO daily_totals (date, kwh) VALUES (?, ?) "
+        f"ON CONFLICT (date) DO UPDATE SET kwh = excluded.kwh WHERE {condition}",
+        (date_str, kwh),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def update_top_days(conn, date_str: str) -> None:
     """Fully recomputes both the affected year's top-10 and the all-time top-10
-    whenever a day's daily_yield_kwh might have changed (a live poll or a backfill's
-    day-total fix). Cheap full recompute rather than an incremental patch - a home
-    system accumulates at most a few hundred rows/year, and this sidesteps edge cases
-    like a backfill correcting an earlier day's total after it was already ranked.
+    whenever a day's total changed (a live poll or a backfill's day-total fix). Full
+    recompute rather than an incremental patch - it sidesteps edge cases like a
+    backfill correcting an earlier day's total after it was already ranked.
 
-    Grouping by substr(timestamp,1,10)/1,4) (UTC date/year) rather than parsing
-    dates in Python: our daylight-only collection window never crosses UTC midnight
-    for a given IST day, so UTC-date == IST-date here - see fetch_daily_kwh in
-    dashboard/app.py, which relies on the same fact."""
+    Reads only daily_totals (one row/day, date-range and kwh-indexed), never
+    `readings`: aggregating per-day totals out of `readings` needs a full-table scan,
+    which on every poll burned ~400M Turso rows-read/month (see db/schema.sql)."""
     year = date.fromisoformat(date_str).year
 
     yearly_rows = conn.execute(
-        "SELECT substr(timestamp, 1, 10) AS d, MAX(daily_yield_kwh) AS kwh FROM readings "
-        "WHERE substr(timestamp, 1, 4) = ? AND daily_yield_kwh IS NOT NULL "
-        "GROUP BY d ORDER BY kwh DESC LIMIT 10",
-        (f"{year:04d}",),
+        "SELECT date, kwh FROM daily_totals WHERE date >= ? AND date < ? "
+        "ORDER BY kwh DESC, date LIMIT 10",
+        (f"{year:04d}-01-01", f"{year + 1:04d}-01-01"),
     ).fetchall()
     conn.execute("DELETE FROM top_days_yearly WHERE year = ?", (year,))
     if yearly_rows:
@@ -225,8 +242,7 @@ def update_top_days(conn, date_str: str) -> None:
         )
 
     alltime_rows = conn.execute(
-        "SELECT substr(timestamp, 1, 10) AS d, MAX(daily_yield_kwh) AS kwh FROM readings "
-        "WHERE daily_yield_kwh IS NOT NULL GROUP BY d ORDER BY kwh DESC LIMIT 10",
+        "SELECT date, kwh FROM daily_totals ORDER BY kwh DESC, date LIMIT 10",
     ).fetchall()
     conn.execute("DELETE FROM top_days_alltime")
     if alltime_rows:
@@ -350,7 +366,9 @@ def main() -> int:
             inserted = insert_rows(conn, rows)
             logging.info("backfill %s: %d rows inserted (%d returned)", day, inserted, len(rows))
             if rows and rows[-1]["daily_yield_kwh"] is not None:
-                update_top_days(conn, day)
+                day_key = rows[-1]["timestamp"][:10]
+                if record_daily_total(conn, day_key, rows[-1]["daily_yield_kwh"]):
+                    update_top_days(conn, day_key)
 
         live_row = fetch_live_reading(goods_id, member_auto_id, token)
         inserted = insert_rows(conn, [live_row])
@@ -360,7 +378,9 @@ def main() -> int:
             live_row["total_yield_kwh"], live_row["status"], "inserted" if inserted else "already had it",
         )
         if live_row["daily_yield_kwh"] is not None:
-            update_top_days(conn, live_row["timestamp"][:10])
+            day_key = live_row["timestamp"][:10]
+            if record_daily_total(conn, day_key, live_row["daily_yield_kwh"]):
+                update_top_days(conn, day_key)
         state["consecutive_failures"] = 0
         save_backoff_state(conn, state)
         return 0

@@ -26,7 +26,7 @@ from polycab_client import AuthError, NetworkError, SchemaError, MonthlyYields, 
 # a package - reuses the collector's own backfill/ranking logic rather than duplicating
 # it for the Admin tab's manual re-backfill capability.
 sys.path.insert(0, str(PROJECT_ROOT / "collector"))
-from collect import fetch_backfill_day, insert_rows, update_top_days  # noqa: E402
+from collect import fetch_backfill_day, insert_rows, record_daily_total, update_top_days  # noqa: E402
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -236,19 +236,16 @@ def compute_day_metrics(df: pd.DataFrame) -> dict:
 
 @st.cache_data(ttl=300)
 def fetch_daily_kwh(_conn, start_date_str: str, end_date_str: str) -> dict:
-    """Keyed by the UTC calendar date substring of `timestamp`. Our daylight-only
-    collection window (00:30-13:30 UTC) never crosses UTC midnight for a given IST
-    day, so UTC-date == IST-date here - no per-row timezone conversion needed.
+    """Reads the collector-maintained daily_totals table (one row/day) rather than
+    aggregating `readings` - that aggregation read every reading in the range (~28K
+    rows for the heatmap's 12 months) on each call, against Turso's rows-read quota.
 
-    Not restricted to source='live': the collector also backfills daily_yield_kwh onto
-    the last row of a backfilled day (from getAllPacMonth), so backfill-only days have a
-    correct total here too - see collector/collect.py."""
-    start_utc = datetime.combine(date.fromisoformat(start_date_str), time.min, IST).astimezone(UTC)
-    end_utc = datetime.combine(date.fromisoformat(end_date_str) + timedelta(days=1), time.min, IST).astimezone(UTC)
+    Keys are UTC-date strings, which equal IST dates here: our daylight-only
+    collection window (00:30-13:30 UTC) never crosses UTC midnight. Covers backfill-only
+    days too - the collector records their getAllPacMonth total the same way."""
     rows = _conn.execute(
-        "SELECT substr(timestamp, 1, 10) AS d, MAX(daily_yield_kwh) FROM readings "
-        "WHERE timestamp >= ? AND timestamp < ? GROUP BY d",
-        (start_utc.isoformat(), end_utc.isoformat()),
+        "SELECT date, kwh FROM daily_totals WHERE date >= ? AND date <= ?",
+        (start_date_str, end_date_str),
     ).fetchall()
     return {r[0]: r[1] for r in rows}
 
@@ -599,6 +596,13 @@ def run_admin_backfill(conn, backfill_date: date) -> tuple[bool, str]:
         conn.execute("DELETE FROM readings WHERE timestamp >= ? AND timestamp < ?",
                      (day_start_utc.isoformat(), day_end_utc.isoformat()))
         inserted = insert_rows(conn, rows)
+        # overwrite=True: the replacement total may be lower than the corrupted one.
+        day_totals = [r["daily_yield_kwh"] for r in rows if r["daily_yield_kwh"] is not None]
+        if day_totals:
+            record_daily_total(conn, rows[-1]["timestamp"][:10], max(day_totals), overwrite=True)
+        else:
+            conn.execute("DELETE FROM daily_totals WHERE date = ?", (rows[-1]["timestamp"][:10],))
+            conn.commit()
         update_top_days(conn, date_str)
     except Exception as e:  # noqa: BLE001 - must not leave a committed delete with no insert
         conn.rollback()

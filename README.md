@@ -63,8 +63,10 @@ the full agreed design (Today tab + Month tab, data sources, and the specific de
 already made about temperature source, chart library, etc.) before implementing this.
 
 ### `db/schema.sql`
-Two tables in Turso: `readings` (the actual data, `source` column distinguishes
-`live`/`backfill` provenance) and `collector_state` (singleton row for backoff bookkeeping).
+Tables in Turso: `readings` (the actual data, `source` column distinguishes
+`live`/`backfill` provenance), `collector_state` (singleton row for backoff bookkeeping),
+`daily_totals` (one row/day of total kWh, maintained by the collector), and
+`top_days_yearly`/`top_days_alltime` (top-10 rankings computed from `daily_totals`).
 
 ### `recon/`
 Reverse-engineering documentation: `notes.md` (full writeup of the API, auth, and signing

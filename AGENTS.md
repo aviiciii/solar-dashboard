@@ -61,6 +61,17 @@ on demand, never 24/7.
   server-side from the requested date/account timezone, not the device's raw clock, and
   lines up correctly with real IST time. If a future endpoint ever surfaces another
   device-reported timestamp, verify its timezone empirically rather than assuming IST.
+- **Never aggregate per-day totals out of `readings` in anything that runs per poll or
+  per dashboard load - use `daily_totals`.** Turso's free tier caps rows *read* at
+  500M/month, and `substr(timestamp, ...)` can't use the PK index, so any
+  `GROUP BY substr(timestamp, 1, 10)` over `readings` is a full-table scan. The collector's
+  top-10 recompute used to do two of those every 5-min poll and burned ~400M rows in
+  September 2026 alone (growing daily with the table). `daily_totals` (one row/day,
+  upserted by `record_daily_total()` in `collect.py`, only-ever-raises except for the
+  Admin re-backfill's `overwrite=True`) replaced that; `update_top_days()` is skipped
+  entirely when a poll doesn't change the day's total. Queries against `readings` should
+  be `timestamp` range scans (PK index) or hit `idx_readings_source_ts`. Check Turso's
+  "Top Queries" page (rank by rows read) after adding any new query.
 - **`TURSO_API_TOKEN` is intentionally not a GitHub Actions secret.** It's a
   platform/management-scope token (decodes to `{org_id}`, no database scope) used only for
   one-time manual provisioning (creating the group/database/token via `api.turso.tech`) -
