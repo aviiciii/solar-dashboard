@@ -124,6 +124,25 @@ def fetch_weather(lat: str, lon: str, today: date) -> dict | None:
         return None
 
 
+# A run before this IST hour reports the *previous* day. GitHub's `schedule:` trigger
+# routinely starts the 21:00 IST job 1-4h late (seen as late as 01:02 IST), and a run
+# that slips past midnight used to report the brand-new day - 0 kWh, no peak. No
+# production happens before ~06:00, so anything earlier is unambiguously a late run
+# for yesterday.
+LATE_RUN_CUTOFF_HOUR = 6
+
+
+def report_date(now_ist: datetime) -> date:
+    """The IST day this run summarizes. REPORT_DATE (YYYY-MM-DD) overrides it, for
+    manually re-sending a specific day's summary via workflow_dispatch/locally."""
+    override = os.environ.get("REPORT_DATE", "").strip()
+    if override:
+        return date.fromisoformat(override)
+    if now_ist.hour < LATE_RUN_CUTOFF_HOUR:
+        return now_ist.date() - timedelta(days=1)
+    return now_ist.date()
+
+
 def pct_change(new: float | None, baseline: float | None) -> float | None:
     if new is None or baseline in (None, 0):
         return None
@@ -190,7 +209,7 @@ def main() -> int:
                        "TURSO_DATABASE_URL / TURSO_AUTH_TOKEN / NTFY_TOPIC")
         return 1
 
-    today = datetime.now(IST).date()
+    today = report_date(datetime.now(IST))
     yesterday = today - timedelta(days=1)
     last_7_days = [today - timedelta(days=n) for n in range(1, 8)]
 

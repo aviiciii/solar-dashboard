@@ -110,8 +110,10 @@ Two workflows, both using `uv sync --locked` + `uv run <script>`:
   IGNORE` + an `ON CONFLICT DO UPDATE` upsert on the single `collector_state` row are both
   atomic; tested with 4 truly concurrent processes racing on the same empty data with zero
   errors or duplicates).
-- **`.github/workflows/daily_alert.yml`** - single daily cron at 21:00 IST (15:30 UTC). A
-  once-a-day trigger doesn't hit the same jitter problem, so no special handling needed.
+- **`.github/workflows/daily_alert.yml`** - single daily cron at 21:00 IST (15:30 UTC). GitHub
+  often starts it 1-4h late (sometimes past IST midnight), so `daily_alert.py` treats any
+  run before 06:00 IST as a late run for the previous day. To re-send a specific day, run it
+  manually with the `report_date` input (or `REPORT_DATE=YYYY-MM-DD` locally).
 
 Both need these **repository secrets** (Settings -> Secrets and variables -> Actions):
 `POLYCAB_TOKEN`, `GOODS_ID`, `MEMBER_AUTO_ID`, `BACKFILL_START_DATE`, `TURSO_DATABASE_URL`,

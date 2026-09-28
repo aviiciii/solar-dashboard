@@ -1,7 +1,12 @@
 name: Daily solar summary
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: "IST date to summarize (YYYY-MM-DD). Blank = today, or yesterday if run before 06:00 IST."
+        required: false
+        default: ""
   schedule:
     - cron: "30 13 * * *"  # 15:30 UTC = 21:00 IST
 
@@ -27,3 +32,4 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           WEATHER_LAT: ${{ secrets.WEATHER_LAT }}
           WEATHER_LON: ${{ secrets.WEATHER_LON }}
+          REPORT_DATE: ${{ github.event.inputs.report_date }}
