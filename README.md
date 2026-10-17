@@ -98,6 +98,7 @@ uv run collector/collect.py       # one-shot: poll + backfill + insert
 uv run collector/run_loop.py      # poll every 5 min until 19:00 IST
 uv run alerts/daily_alert.py       # one-shot: send today's summary notification
 uv run streamlit run dashboard/app.py
+uv run pytest                      # test suite (no network needed)
 ```
 
 `.env` is gitignored and never committed. It needs (see `.env.example` for exactly how to

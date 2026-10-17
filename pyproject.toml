@@ -15,3 +15,14 @@ dependencies = [
     "watchdog>=6.0.0",
     "lesley>=0.3.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The scripts aren't packages (they're run as `uv run collector/collect.py`), so put their
+# directories on sys.path the same way they import each other.
+pythonpath = [".", "collector", "alerts", "backup"]

@@ -113,15 +113,20 @@ tracked file - `recon/sample_responses/` uses `<PLACEHOLDER>`s for the same reas
 - `plan.md` - original project plan. Mostly executed; historical context only at this point.
 - `README.md` - user-facing setup/run instructions for both local and GitHub Actions.
 
-## Testing approach so far
+## Testing approach
 
-No automated test suite exists. Everything has been validated by running the real scripts
-against the live Turso DB and the live Polycab API directly (see conversation history /
-commit messages for specifics: idempotency re-runs, simulated outage/gap recovery, auth
-failure -> backoff -> recovery cycles, and the 4-way concurrency race). If you add automated
-tests, keep using the real `polycab_client.call()` signing logic rather than mocking it away
-- the signing scheme is exactly the kind of thing that's easy to accidentally break in a way
-mocks wouldn't catch.
+`uv run pytest` (also runs in `.github/workflows/test.yml` on every push to main and every
+PR). The suite covers the logic that needs no network: request signing (pinned outputs of
+the real `sign()` plus a decrypt-and-check of the canonical string - never mock signing
+away, it's exactly what's easy to break in a way mocks wouldn't catch), kWh integration,
+backoff, daily-total/top-10 maintenance and transaction rollback (against an in-memory DB
+through the real `libsql` driver, which also catches named-param mistakes), run_loop's
+window/handoff planning, the daily alert's date/message logic, and backup dump/retention.
+
+Things it can't cover are still validated by running the real scripts against the live
+Turso DB and Polycab API (see commit messages for specifics: idempotency re-runs, simulated
+outage/gap recovery, auth failure -> backoff -> recovery cycles, the 4-way concurrency race,
+and the collect.yml chain handoff, tested by dispatching a short chain on a branch).
 
 ## `dashboard/app.py` - design decisions worth knowing
 
