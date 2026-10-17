@@ -77,6 +77,14 @@ on demand, never 24/7.
   one-time manual provisioning (creating the group/database/token via `api.turso.tech`) -
   `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` are what the scripts actually connect with.
 
+- **The weekly backup workflow lives in the private `aviiciii/solar-dashboard-backups`
+  repo, not here** - this repo is public. It checks out this repo's `main` and runs
+  `backup/dump.py` + `backup/prune.py`, publishing each dump as a Release there (Releases,
+  not commits, so retention can actually free space - git history can't be thinned without
+  a force-push). It connects with `TURSO_BACKUP_TOKEN`, a deliberately *read-only* token;
+  don't swap it for `TURSO_AUTH_TOKEN`. It reads every row once per week (rowid keyset
+  pages), which is fine for the rows-read cap at weekly cadence - don't run it per-poll.
+
 ## Key identifiers (this specific account, not generic)
 
 - `GOODS_ID` (inverter serial): `2620-119401326P`, model `PSIS-5K0`

@@ -124,6 +124,25 @@ manual provisioning, never read by any script.)
 Both are manually triggerable too: `gh workflow run collect.yml` / `gh workflow run
 daily_alert.yml`, or via the Actions tab.
 
+### Weekly backup
+
+The workflow lives in the **private** `aviiciii/solar-dashboard-backups` repo, not here
+(this repo is public). Sundays 23:00 IST it checks out this repo, runs `backup/dump.py`
+(whole Turso DB -> gzipped plain-text SQL, ~0.7 MB as of 2026-10) and publishes the dump as
+a GitHub Release there, tagged `backup-YYYY-MM-DD`. It refuses to publish (and alerts via
+ntfy) if `readings` shrank >10% since the previous backup.
+
+Retention (`backup/prune.py`): nothing is deleted while all backups fit in 1 GB; past that,
+past months are thinned oldest-first to one backup each (that month's last), only until it
+fits again. The current month is never thinned and no month ever loses its last backup.
+
+Its secrets live in that repo: `TURSO_DATABASE_URL`, `TURSO_BACKUP_TOKEN` (read-only Turso
+token, see `.env.example`), `NTFY_TOPIC`.
+
+Restore: `gh release download backup-YYYY-MM-DD -R aviiciii/solar-dashboard-backups`, then
+`gunzip -c solar-dashboard-YYYY-MM-DD.sql.gz | sqlite3 restored.db` (or pipe into
+`turso db shell <db>`). Locally: `uv run backup/dump.py some/path/backup.sql.gz`.
+
 ## Data model
 
 `readings` table (Turso):
