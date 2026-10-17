@@ -57,3 +57,14 @@ def test_fetch_live_status_failure_propagates_auth_errors(monkeypatch):
     }))
     with pytest.raises(polycab_client.AuthError):
         polycab_client.fetch_live("goods", "member", "token")
+
+
+def test_fetch_live_empty_plant_list_means_unknown_status(monkeypatch):
+    """An empty AllGroupList used to crash the dashboard's live snapshot (IndexError)."""
+    monkeypatch.setattr(polycab_client, "call", fake_call({
+        "InverterDetailInfoNewone": sample("InverterDetailInfoNewone"),
+        "GroupList": {"AllGroupList": []},
+    }))
+    live = polycab_client.fetch_live("goods", "member", "token")
+    assert live["status"] is None
+    assert live["daily_yield_kwh"] == 10.27

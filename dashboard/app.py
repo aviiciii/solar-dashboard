@@ -6,6 +6,7 @@ design rationale.
 """
 
 import base64
+import hmac
 import os
 import sys
 from datetime import date, datetime, time, timedelta
@@ -909,7 +910,8 @@ with tab_admin:
         if not st.session_state["admin_authed"]:
             admin_pw = st.text_input("Admin password", type="password", key="admin_pw_input")
             if st.button("Log in", key="admin_login_btn"):
-                if admin_pw == ADMIN_PASSWORD:
+                # Constant-time compare - the app is publicly reachable on Streamlit Cloud.
+                if hmac.compare_digest(admin_pw.encode(), ADMIN_PASSWORD.encode()):
                     st.session_state["admin_authed"] = True
                     st.rerun()
                 else:

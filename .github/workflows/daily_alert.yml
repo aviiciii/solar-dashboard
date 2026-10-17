@@ -33,3 +33,14 @@ jobs:
           WEATHER_LAT: ${{ secrets.WEATHER_LAT }}
           WEATHER_LON: ${{ secrets.WEATHER_LON }}
           REPORT_DATE: ${{ github.event.inputs.report_date }}
+
+      # Without this a failed run (expired token, API down, crash) just means no summary
+      # arrives - easy to miss. Same alert pattern as the backup workflow.
+      - name: Alert on failure
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          curl -s --max-time 15 -H "Title: Solar daily summary" \
+            -d "Daily summary failed to send - see ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/$NTFY_TOPIC" || true
