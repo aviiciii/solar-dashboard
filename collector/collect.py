@@ -26,31 +26,20 @@ loop (unlike exit 1, which the loop logs and continues past).
 
 import json
 import logging
-import logging.handlers
 import os
 import sys
 from datetime import datetime, timedelta, date
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import libsql
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from polycab_client import call, num, MonthlyYields, AuthError, NetworkError, SchemaError  # noqa: E402
+from common import IST, UTC, cumulative_kwh, setup_logging  # noqa: E402
+from polycab_client import (call, fetch_live, num, MonthlyYields, AuthError, NetworkError,  # noqa: E402
+                            SchemaError)
 from ntfy_client import send_ntfy  # noqa: E402
-
-IST = ZoneInfo("Asia/Kolkata")
-# InverterDetailInfoNewone's DataTime field is the device's own RTC clock, reported in
-# China Standard Time (UTC+8) regardless of the plant's actual location/configured
-# timezone (+5:30) - confirmed empirically: a live DataTime matched real-world UTC+8
-# clock time to within ~2 minutes, but was 2.5h ahead of real IST time. getAllPacDay_v1's
-# `inTime` (used for backfill) is genuinely IST - it's parameterized by date/account
-# timezone server-side, not the raw device clock, and lines up correctly with real time.
-DEVICE_CLOCK_TZ = ZoneInfo("Asia/Shanghai")
-
-STATUS_BY_COLOR = {"Green": "normal", "yellow": "standby", "red": "abnormal", "gray": "offline"}
 
 
 def alert_once_per_failure_streak(ntfy_topic: str, was_already_failing: bool, title: str, message: str) -> None:
@@ -65,69 +54,27 @@ def alert_once_per_failure_streak(ntfy_topic: str, was_already_failing: bool, ti
         logging.warning("could not send ntfy alert: %s", e)
 
 
-def to_utc_iso(local_dt: datetime, tz: ZoneInfo = IST) -> str:
-    return local_dt.replace(tzinfo=tz).astimezone(ZoneInfo("UTC")).isoformat()
+def to_utc_iso(local_dt: datetime) -> str:
+    return local_dt.replace(tzinfo=IST).astimezone(UTC).isoformat()
 
 
 def fetch_live_reading(goods_id: str, member_auto_id: str, token: str) -> dict:
-    detail = call("InverterDetailInfoNewone", {"GoodsID": goods_id}, token)
-    try:
-        ac = detail["ACDCInfo"]
-        data_time_str = detail["DataTime"]
-    except KeyError as e:
-        raise SchemaError(f"InverterDetailInfoNewone: missing expected field {e}") from e
-
-    local_dt = datetime.strptime(data_time_str, "%Y-%m-%d %H:%M:%S")
-    timestamp = to_utc_iso(local_dt, tz=DEVICE_CLOCK_TZ)
-
-    status = None
-    try:
-        group_list = call("GroupList", {"MemberAutoID": member_auto_id, "inputValue": ""}, token)
-        inv_status = group_list["AllGroupList"][0]["InverterStatus"]
-        active_color = next((c for c, n in inv_status.items() if n), None)
-        status = STATUS_BY_COLOR.get(active_color)
-    except (AuthError, NetworkError):
-        raise  # these matter - propagate
-    except Exception as e:  # noqa: BLE001 - status is best-effort, never fail the whole poll over it
-        logging.warning("could not determine status from GroupList: %s", e)
-
-    def first(arr):
-        return num(arr[0]) if arr else None
-
-    daily_yield = num(detail.get("EToday"))
-    total_yield = num(detail.get("ETotal"))
-
+    live = fetch_live(goods_id, member_auto_id, token)
     return {
-        "timestamp": timestamp,
-        "pv_power_w": first(ac.get("Pac")),
-        "daily_yield_kwh": daily_yield / 1000 if daily_yield is not None else None,
-        "total_yield_kwh": total_yield / 1000 if total_yield is not None else None,
-        "ac_voltage": first(ac.get("Vac")),
-        "ac_current": first(ac.get("Iac")),
-        "ac_frequency": first(ac.get("Fac")),
-        "temperature_c": num(detail.get("Tntc")),
-        "status": status,
+        "timestamp": live["reported_at"].astimezone(UTC).isoformat(),
+        **{col: live[col] for col in ("pv_power_w", "daily_yield_kwh", "total_yield_kwh", "ac_voltage",
+                                      "ac_current", "ac_frequency", "temperature_c", "status")},
         "source": "live",
-        "raw_json": json.dumps(detail),
+        "raw_json": json.dumps(live["detail"]),
     }
 
 
 def integrate_kwh(rows: list[dict]) -> float:
-    """Trapezoidal-rule integration of a chronological list of backfill row dicts'
-    pv_power_w over time -> total kWh. Used as a fallback day total (see
-    fetch_backfill_day) - same approximation as dashboard/app.py's add_cumulative_kwh,
-    just operating on row dicts instead of a DataFrame since that's what this module
-    works with before insertion."""
-    total_kwh = 0.0
-    prev_dt, prev_w = None, None
-    for row in rows:
-        dt = datetime.fromisoformat(row["timestamp"])
-        w = row["pv_power_w"] or 0
-        if prev_dt is not None:
-            hours = (dt - prev_dt).total_seconds() / 3600
-            total_kwh += hours * (w + prev_w) / 2 / 1000
-        prev_dt, prev_w = dt, w
-    return total_kwh
+    """Total kWh under a chronological list of row dicts' pv_power_w - the fallback day
+    total in fetch_backfill_day. Same integration as the dashboard's cumulative charts
+    (common.cumulative_kwh)."""
+    totals = cumulative_kwh([(datetime.fromisoformat(r["timestamp"]), r["pv_power_w"]) for r in rows])
+    return totals[-1] if totals else 0.0
 
 
 def fetch_backfill_day(date_str: str, member_auto_id: str, token: str, monthly_yields: MonthlyYields) -> list[dict]:
@@ -277,7 +224,7 @@ def dates_needing_backfill(conn, backfill_start: date | None, stale_minutes: int
     needs_today = (
         last_local_date is None
         or last_local_date < today_local
-        or (datetime.now(ZoneInfo("UTC")) - last_ts_utc) > timedelta(minutes=stale_minutes)
+        or (datetime.now(UTC) - last_ts_utc) > timedelta(minutes=stale_minutes)
     )
 
     days = gap_days + ([today_local.isoformat()] if needs_today else [])
@@ -319,16 +266,6 @@ def backoff_minutes_for(consecutive_failures: int) -> int:
     return min(5 * (2 ** (consecutive_failures - 1)), 60)
 
 
-def setup_logging(log_path: Path) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.handlers.RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=5)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(handler)
-    root.addHandler(logging.StreamHandler(sys.stdout))
-
-
 def main() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
 
@@ -357,14 +294,14 @@ def main() -> int:
     state = load_backoff_state(conn)
     if state["consecutive_failures"] > 0 and state["last_attempt"]:
         cooldown = backoff_minutes_for(state["consecutive_failures"])
-        elapsed = datetime.now(ZoneInfo("UTC")) - datetime.fromisoformat(state["last_attempt"])
+        elapsed = datetime.now(UTC) - datetime.fromisoformat(state["last_attempt"])
         if elapsed < timedelta(minutes=cooldown):
             logging.warning("in backoff after %d consecutive failures, skipping this cycle "
                              "(retry in %.0f min)", state["consecutive_failures"],
                              (timedelta(minutes=cooldown) - elapsed).total_seconds() / 60)
             return 0
 
-    state["last_attempt"] = datetime.now(ZoneInfo("UTC")).isoformat()
+    state["last_attempt"] = datetime.now(UTC).isoformat()
 
     try:
         monthly_yields = MonthlyYields(member_auto_id, token)

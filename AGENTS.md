@@ -59,9 +59,9 @@ process kept awake by collect.yml's ping - and also runs locally.
 - **`InverterDetailInfoNewone`'s `DataTime` field is the device's own RTC clock, reported
   in China Standard Time (UTC+8), not the plant's actual timezone (IST, UTC+5:30).**
   Confirmed empirically: a live `DataTime` matched real-world UTC+8 clock time to within
-  ~2 minutes, but was 2.5h ahead of real IST time - both collector/collect.py (see
-  `DEVICE_CLOCK_TZ`) and dashboard/app.py's live snapshot convert it accordingly before
-  use. `getAllPacDay_v1`'s `inTime` (used for backfill) is NOT affected - it's computed
+  ~2 minutes, but was 2.5h ahead of real IST time - `polycab_client.fetch_live()` (see
+  `DEVICE_CLOCK_TZ`), which both the collector and the dashboard's live snapshot use,
+  converts it accordingly. `getAllPacDay_v1`'s `inTime` (used for backfill) is NOT affected - it's computed
   server-side from the requested date/account timezone, not the device's raw clock, and
   lines up correctly with real IST time. If a future endpoint ever surfaces another
   device-reported timestamp, verify its timezone empirically rather than assuming IST.

@@ -31,8 +31,10 @@ GitHub Actions                                           Streamlit Community Clo
 Shared HTTP client for the Polycab/Solarman JSON API. Handles the request-signing scheme
 (AES-256-CBC over a canonical sorted query string, reverse-engineered from the vendor's
 frontend JS bundle - see `recon/notes.md` for the full derivation) and categorizes failures
-into `AuthError` / `NetworkError` / `SchemaError`. Used by both `collector/collect.py` and
-`alerts/daily_alert.py` - don't duplicate this logic elsewhere.
+into `AuthError` / `NetworkError` / `SchemaError`. `fetch_live()` parses the inverter's
+current reading + status (including the device-clock timezone fix) for both the collector
+and the dashboard - don't duplicate this logic elsewhere. Small cross-cutting helpers
+(timezones, logging setup, % change, kWh integration) live in `common.py`.
 
 ### `collector/collect.py`
 One-shot script: poll the inverter's current reading, backfill any missing history, insert

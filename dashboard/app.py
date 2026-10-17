@@ -10,7 +10,6 @@ import os
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import altair as alt
 import lesley
@@ -22,7 +21,8 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from polycab_client import AuthError, NetworkError, SchemaError, MonthlyYields, call, num  # noqa: E402
+from common import IST, UTC, cumulative_kwh, pct_change  # noqa: E402
+from polycab_client import AuthError, NetworkError, SchemaError, MonthlyYields, fetch_live  # noqa: E402
 # collector/ has no __init__.py, so this is imported as a bare module via sys.path, not
 # a package - reuses the collector's own backfill/ranking logic rather than duplicating
 # it for the Admin tab's manual re-backfill capability.
@@ -30,13 +30,6 @@ sys.path.insert(0, str(PROJECT_ROOT / "collector"))
 from collect import fetch_backfill_day, insert_rows, record_daily_total, update_top_days  # noqa: E402
 
 load_dotenv(PROJECT_ROOT / ".env")
-
-IST = ZoneInfo("Asia/Kolkata")
-UTC = ZoneInfo("UTC")
-# InverterDetailInfoNewone's DataTime is the device's own RTC clock, reported in China
-# Standard Time (UTC+8) regardless of the plant's actual location - confirmed empirically
-# against real clock time. See the matching comment in collector/collect.py.
-DEVICE_CLOCK_TZ = ZoneInfo("Asia/Shanghai")
 
 POLYCAB_TOKEN = os.environ.get("POLYCAB_TOKEN", "").strip()
 GOODS_ID = os.environ.get("GOODS_ID", "").strip()
@@ -55,8 +48,6 @@ PANEL_BRAND = "Waaree"
 INVERTER_MODEL = "PSIS-5K0"
 INSTALLED_KWP = PANEL_COUNT * PANEL_WATTAGE_W / 1000
 INSTALL_DATE = date(2026, 7, 18)
-
-STATUS_BY_COLOR = {"Green": "normal", "yellow": "standby", "red": "abnormal", "gray": "offline"}
 
 st.set_page_config(page_title="Solar Dashboard", page_icon="☀️", layout="wide")
 
@@ -82,36 +73,17 @@ def get_conn():
 @st.cache_data(ttl=60)
 def fetch_live_snapshot():
     try:
-        detail = call("InverterDetailInfoNewone", {"GoodsID": GOODS_ID}, POLYCAB_TOKEN)
-        group_list = call("GroupList", {"MemberAutoID": MEMBER_AUTO_ID, "inputValue": ""}, POLYCAB_TOKEN)
+        live = fetch_live(GOODS_ID, MEMBER_AUTO_ID, POLYCAB_TOKEN)
     except (AuthError, NetworkError, SchemaError) as e:
         return None, str(e)
-
-    ac = detail.get("ACDCInfo", {})
-    inv_status = group_list.get("AllGroupList", [{}])[0].get("InverterStatus", {})
-    active_color = next((c for c, n in inv_status.items() if n), None)
-
-    today_kwh = num(detail.get("EToday"))
-    total_kwh = num(detail.get("ETotal"))
-
-    def first(arr):
-        return num(arr[0]) if arr else None
-
-    last_update_ist = None
-    if detail.get("DataTime"):
-        last_update_ist = (datetime.strptime(detail["DataTime"], "%Y-%m-%d %H:%M:%S")
-                            .replace(tzinfo=DEVICE_CLOCK_TZ).astimezone(IST))
-
     return {
-        "power_w": first(ac.get("Pac")),
-        "today_kwh": today_kwh / 1000 if today_kwh is not None else None,
-        "total_kwh": total_kwh / 1000 if total_kwh is not None else None,
-        "temperature_c": num(detail.get("Tntc")),
-        "status": STATUS_BY_COLOR.get(active_color),
-        "last_update": last_update_ist.strftime("%Y-%m-%d %H:%M:%S") if last_update_ist else None,
-        "mdsp_version": detail.get("MDSPVersion"),
-        "sdsp_version": detail.get("SDSPVersion"),
-        "csb_version": detail.get("CSBVersion"),
+        "power_w": live["pv_power_w"],
+        "today_kwh": live["daily_yield_kwh"],
+        "total_kwh": live["total_yield_kwh"],
+        "temperature_c": live["temperature_c"],
+        "status": live["status"],
+        "last_update": live["reported_at"].astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        "firmware": live["firmware"],
     }, None
 
 
@@ -167,15 +139,11 @@ def fetch_week_readings(_conn, week_start_str: str, week_end_str: str) -> pd.Dat
 
 
 def add_cumulative_kwh(df: pd.DataFrame) -> pd.DataFrame:
-    """Trapezoidal-rule integration of pv_power_w over time -> cumulative_kwh column.
-    `df` must already be sorted by timestamp_ist. Shared by the main cumulative chart
-    and the per-day curves behind the "average this week" overlay, so the same
-    approximation is used consistently rather than duplicated in two places."""
+    """cumulative_kwh column via common.cumulative_kwh - the same integration as the
+    collector's fallback day total. `df` must already be sorted by timestamp_ist. Shared by
+    the main cumulative chart and the per-day curves behind the "average this week" overlay."""
     df = df.copy()
-    dt_hours = df["timestamp_ist"].diff().dt.total_seconds().fillna(0) / 3600
-    power_filled = df["pv_power_w"].fillna(0)
-    avg_power = (power_filled + power_filled.shift(1).fillna(power_filled)) / 2
-    df["cumulative_kwh"] = (dt_hours * avg_power / 1000).cumsum()
+    df["cumulative_kwh"] = cumulative_kwh(list(zip(df["timestamp_ist"], df["pv_power_w"])))
     return df
 
 
@@ -642,13 +610,69 @@ def confirm_backfill_dialog(conn, backfill_date: date) -> None:
         st.rerun()
 
 
+def period_kpis(conn, ref_date: date) -> dict:
+    """Average daily kWh for ref_date's week and month (capped at today), each with its %
+    change vs the previous week/month - shown on both the Today and Day tabs. Also returns
+    the fetched {date_str: kwh} map, which the Today tab reuses for yesterday's total."""
+    today = datetime.now(IST).date()
+    week_start, week_end = week_bounds(ref_date)
+    last_week_start, last_week_end = week_start - timedelta(days=7), week_start - timedelta(days=1)
+    month_start, month_end = month_bounds(ref_date)
+    last_month_start, last_month_end = month_bounds(month_start - timedelta(days=1))
+
+    kwh_by_date = fetch_daily_kwh(conn, min(last_week_start, last_month_start).isoformat(),
+                                  min(max(week_end, month_end), today).isoformat())
+    avg_week = avg_kwh_in_range(kwh_by_date, week_start, min(week_end, today))
+    avg_month = avg_kwh_in_range(kwh_by_date, month_start, min(month_end, today))
+    return {
+        "kwh_by_date": kwh_by_date,
+        "avg_week": avg_week,
+        "week_delta": pct_change(avg_week, avg_kwh_in_range(kwh_by_date, last_week_start, last_week_end)),
+        "avg_month": avg_month,
+        "month_delta": pct_change(avg_month, avg_kwh_in_range(kwh_by_date, last_month_start, last_month_end)),
+    }
+
+
+def render_sun_and_averages(ref_date: date, kpis: dict) -> None:
+    sun = {}
+    if WEATHER_LAT and WEATHER_LON:
+        _, sun = fetch_hourly_weather_for_date(WEATHER_LAT, WEATHER_LON, ref_date.isoformat())
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Sunrise (IST)", sun.get("sunrise") or "-")
+    col2.metric("Sunset (IST)", sun.get("sunset") or "-")
+    col3.metric(
+        "Avg Production This Week",
+        f"{kpis['avg_week']:.2f} kWh/day" if kpis["avg_week"] is not None else "-",
+        delta=f"{kpis['week_delta']:+.0f}% vs last week" if kpis["week_delta"] is not None else None,
+    )
+    col4.metric(
+        "Avg Production This Month",
+        f"{kpis['avg_month']:.2f} kWh/day" if kpis["avg_month"] is not None else "-",
+        delta=f"{kpis['month_delta']:+.0f}% vs last month" if kpis["month_delta"] is not None else None,
+    )
+
+
+def render_specs(live: dict | None = None) -> None:
+    """Static plant specs, plus firmware versions when a live snapshot is available."""
+    with st.expander("Technical specs"):
+        spec_col1, spec_col2 = st.columns(2)
+        firmware = live["firmware"] if live else None
+        spec_col1.markdown(
+            f"**Inverter model:** {INVERTER_MODEL}  \n"
+            f"**Serial:** {GOODS_ID}  \n"
+            f"**Rated capacity:** 5 kW"
+            + (f"  \n**Firmware (MDSP/SDSP/CSB):** {firmware['MDSP']} / {firmware['SDSP']} / {firmware['CSB']}"
+               if firmware else "")
+        )
+        spec_col2.markdown(
+            f"**Panels:** {PANEL_COUNT} x {PANEL_BRAND} {PANEL_WATTAGE_W}W  \n"
+            f"**Installed capacity:** {INSTALLED_KWP:.2f} kWp  \n"
+            f"**Install date:** {INSTALL_DATE.isoformat()}"
+        )
+
+
 conn = get_conn()
 tab_today, tab_day, tab_month, tab_admin = st.tabs(["Today", "Day", "Month", "Admin"])
-
-def pct_delta(current, previous):
-    if current is None or previous in (None, 0):
-        return None
-    return (current - previous) / previous * 100
 
 
 with tab_today:
@@ -658,25 +682,10 @@ with tab_today:
                    f"showing historical data only.")
 
     today_date = datetime.now(IST).date()
-    yesterday = today_date - timedelta(days=1)
-    this_week_start, _ = week_bounds(today_date)
-    last_week_start = this_week_start - timedelta(days=7)
-    last_week_end = this_week_start - timedelta(days=1)
-    this_month_start, _ = month_bounds(today_date)
-    last_month_start, last_month_end = month_bounds(this_month_start - timedelta(days=1))
-
-    kwh_by_date_recent = fetch_daily_kwh(conn, min(last_week_start, last_month_start).isoformat(),
-                                          today_date.isoformat())
-    avg_this_week = avg_kwh_in_range(kwh_by_date_recent, this_week_start, today_date)
-    avg_last_week = avg_kwh_in_range(kwh_by_date_recent, last_week_start, last_week_end)
-    avg_this_month = avg_kwh_in_range(kwh_by_date_recent, this_month_start, today_date)
-    avg_last_month = avg_kwh_in_range(kwh_by_date_recent, last_month_start, last_month_end)
-    week_delta = pct_delta(avg_this_week, avg_last_week)
-    month_delta = pct_delta(avg_this_month, avg_last_month)
-
-    yesterday_kwh = kwh_by_date_recent.get(yesterday.isoformat())
+    kpis = period_kpis(conn, today_date)
+    yesterday_kwh = kpis["kwh_by_date"].get((today_date - timedelta(days=1)).isoformat())
     today_kwh = live["today_kwh"] if live else None
-    yield_delta = pct_delta(today_kwh, yesterday_kwh)
+    yield_delta = pct_change(today_kwh, yesterday_kwh)
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Current Power", f"{live['power_w']:.0f} W" if live and live["power_w"] is not None else "-")
@@ -688,39 +697,8 @@ with tab_today:
     col3.metric("Status", (live["status"] or "unknown").capitalize() if live else "-")
     col4.metric("Last Update (IST)", live["last_update"] if live else "-")
 
-    today_str_for_sun = today_date.isoformat()
-    sun = {}
-    if WEATHER_LAT and WEATHER_LON:
-        _, sun = fetch_hourly_weather_for_date(WEATHER_LAT, WEATHER_LON, today_str_for_sun)
-
-    row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
-    row2_col1.metric("Sunrise (IST)", sun.get("sunrise") or "-")
-    row2_col2.metric("Sunset (IST)", sun.get("sunset") or "-")
-    row2_col3.metric(
-        "Avg Production This Week",
-        f"{avg_this_week:.2f} kWh/day" if avg_this_week is not None else "-",
-        delta=f"{week_delta:+.0f}% vs last week" if week_delta is not None else None,
-    )
-    row2_col4.metric(
-        "Avg Production This Month",
-        f"{avg_this_month:.2f} kWh/day" if avg_this_month is not None else "-",
-        delta=f"{month_delta:+.0f}% vs last month" if month_delta is not None else None,
-    )
-
-    with st.expander("Technical specs"):
-        spec_col1, spec_col2 = st.columns(2)
-        spec_col1.markdown(
-            f"**Inverter model:** {INVERTER_MODEL}  \n"
-            f"**Serial:** {GOODS_ID}  \n"
-            f"**Rated capacity:** 5 kW  \n"
-            + (f"**Firmware (MDSP/SDSP/CSB):** {live['mdsp_version']} / "
-               f"{live['sdsp_version']} / {live['csb_version']}" if live else "**Firmware:** unavailable")
-        )
-        spec_col2.markdown(
-            f"**Panels:** {PANEL_COUNT} x {PANEL_BRAND} {PANEL_WATTAGE_W}W  \n"
-            f"**Installed capacity:** {INSTALLED_KWP:.2f} kWp  \n"
-            f"**Install date:** {INSTALL_DATE.isoformat()}"
-        )
+    render_sun_and_averages(today_date, kpis)
+    render_specs(live)
 
     last_sync = fetch_last_sync(conn)
     now_ist = datetime.now(IST)
@@ -756,50 +734,8 @@ with tab_day:
                  if metrics["status"] else "N/A (backfill only)")
     dcol4.metric("Last Reading (IST)", metrics["last_reading"] or "-")
 
-    sun = {}
-    if WEATHER_LAT and WEATHER_LON:
-        _, sun = fetch_hourly_weather_for_date(WEATHER_LAT, WEATHER_LON, selected_date.isoformat())
-
-    day_week_start, day_week_end = week_bounds(selected_date)
-    day_last_week_start = day_week_start - timedelta(days=7)
-    day_last_week_end = day_week_start - timedelta(days=1)
-    day_month_start, day_month_end = month_bounds(selected_date)
-    day_last_month_start, day_last_month_end = month_bounds(day_month_start - timedelta(days=1))
-
-    kwh_by_date_day = fetch_daily_kwh(
-        conn, min(day_last_week_start, day_last_month_start).isoformat(),
-        min(max(day_week_end, day_month_end), today).isoformat(),
-    )
-    avg_day_week = avg_kwh_in_range(kwh_by_date_day, day_week_start, min(day_week_end, today))
-    avg_day_last_week = avg_kwh_in_range(kwh_by_date_day, day_last_week_start, day_last_week_end)
-    avg_day_month = avg_kwh_in_range(kwh_by_date_day, day_month_start, min(day_month_end, today))
-    avg_day_last_month = avg_kwh_in_range(kwh_by_date_day, day_last_month_start, day_last_month_end)
-    day_week_delta = pct_delta(avg_day_week, avg_day_last_week)
-    day_month_delta = pct_delta(avg_day_month, avg_day_last_month)
-
-    day_sun_col1, day_sun_col2, day_sun_col3, day_sun_col4 = st.columns(4)
-    day_sun_col1.metric("Sunrise (IST)", sun.get("sunrise") or "-")
-    day_sun_col2.metric("Sunset (IST)", sun.get("sunset") or "-")
-    day_sun_col3.metric(
-        "Avg Production This Week",
-        f"{avg_day_week:.2f} kWh/day" if avg_day_week is not None else "-",
-        delta=f"{day_week_delta:+.0f}% vs last week" if day_week_delta is not None else None,
-    )
-    day_sun_col4.metric(
-        "Avg Production This Month",
-        f"{avg_day_month:.2f} kWh/day" if avg_day_month is not None else "-",
-        delta=f"{day_month_delta:+.0f}% vs last month" if day_month_delta is not None else None,
-    )
-
-    with st.expander("Technical specs"):
-        st.markdown(
-            f"**Inverter model:** {INVERTER_MODEL}  \n"
-            f"**Serial:** {GOODS_ID}  \n"
-            f"**Rated capacity:** 5 kW  \n"
-            f"**Panels:** {PANEL_COUNT} x {PANEL_BRAND} {PANEL_WATTAGE_W}W  \n"
-            f"**Installed capacity:** {INSTALLED_KWP:.2f} kWp  \n"
-            f"**Install date:** {INSTALL_DATE.isoformat()}"
-        )
+    render_sun_and_averages(selected_date, period_kpis(conn, selected_date))
+    render_specs()
 
     render_top_days_banner(conn, selected_date)
     render_production_section(conn, selected_date, key_prefix="day")

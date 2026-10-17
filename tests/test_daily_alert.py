@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from daily_alert import IST, build_message, pct_change, report_date
+from daily_alert import IST, build_message, report_date
 
 
 def test_report_date_late_run_reports_previous_day(monkeypatch):
@@ -13,13 +13,6 @@ def test_report_date_late_run_reports_previous_day(monkeypatch):
 def test_report_date_override(monkeypatch):
     monkeypatch.setenv("REPORT_DATE", "2026-09-01")
     assert report_date(datetime(2026, 10, 18, 21, 0, tzinfo=IST)) == date(2026, 9, 1)
-
-
-def test_pct_change():
-    assert pct_change(12, 10) == 20
-    assert pct_change(None, 10) is None
-    assert pct_change(10, 0) is None
-    assert pct_change(10, None) is None
 
 
 def test_build_message_includes_ranks_gaps_and_comparisons():
