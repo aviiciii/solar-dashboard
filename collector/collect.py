@@ -210,7 +210,7 @@ def record_daily_total(conn, date_str: str, kwh: float, overwrite: bool = False,
 
     Default mode only ever raises a day's total (`MAX` semantics, same as the old
     `MAX(daily_yield_kwh)` aggregation over `readings`), and the conditional DO UPDATE
-    is atomic, so it's safe under collect.yml's deliberately-overlapping segments.
+    is atomic, so it's safe under collect.yml's deliberately-overlapping runs.
     `overwrite=True` is for the Admin tab's re-backfill, which can legitimately lower a
     day's total when replacing corrupted readings."""
     condition = "excluded.kwh IS NOT daily_totals.kwh" if overwrite else "excluded.kwh > daily_totals.kwh"

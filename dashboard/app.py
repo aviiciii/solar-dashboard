@@ -1,7 +1,8 @@
 """
-Streamlit dashboard. Run manually (`uv run streamlit run dashboard/app.py`) and stop when
-done - never runs 24/7. Read-only against Turso; live snapshot comes from the Polycab API
-directly. See AGENTS.md for the full design rationale.
+Streamlit dashboard - deployed on Streamlit Community Cloud, or run locally with
+`uv run streamlit run dashboard/app.py`. Reads from Turso (only the password-gated Admin
+tab writes); the live snapshot comes from the Polycab API directly. See AGENTS.md for the
+design rationale.
 """
 
 import base64
