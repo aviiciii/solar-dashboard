@@ -183,9 +183,13 @@ _READING_COLUMNS = [
 ]
 
 
-def insert_rows(conn, rows: list[dict]) -> int:
+def insert_rows(conn, rows: list[dict], commit: bool = True) -> int:
     """libsql (unlike sqlite3) only supports positional `?` params, not named `:key`
-    ones - so rows are converted to tuples in _READING_COLUMNS order here."""
+    ones - so rows are converted to tuples in _READING_COLUMNS order here.
+
+    commit=False (here and in record_daily_total / update_top_days) leaves the write in
+    the caller's open transaction - the Admin tab's re-backfill uses it to make its
+    delete + reinsert + totals + rankings a single all-or-nothing commit."""
     if not rows:
         return 0
     placeholders = ", ".join("?" for _ in _READING_COLUMNS)
@@ -194,11 +198,12 @@ def insert_rows(conn, rows: list[dict]) -> int:
         f"INSERT OR IGNORE INTO readings ({', '.join(_READING_COLUMNS)}) VALUES ({placeholders})",
         values,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.rowcount
 
 
-def record_daily_total(conn, date_str: str, kwh: float, overwrite: bool = False) -> bool:
+def record_daily_total(conn, date_str: str, kwh: float, overwrite: bool = False, commit: bool = True) -> bool:
     """Upserts one day's total into daily_totals and reports whether it actually
     changed - callers skip update_top_days() when it didn't (e.g. an idle overnight
     poll re-reporting the same EToday), which is most of the collector's read savings.
@@ -214,11 +219,12 @@ def record_daily_total(conn, date_str: str, kwh: float, overwrite: bool = False)
         f"ON CONFLICT (date) DO UPDATE SET kwh = excluded.kwh WHERE {condition}",
         (date_str, kwh),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.rowcount > 0
 
 
-def update_top_days(conn, date_str: str) -> None:
+def update_top_days(conn, date_str: str, commit: bool = True) -> None:
     """Fully recomputes both the affected year's top-10 and the all-time top-10
     whenever a day's total changed (a live poll or a backfill's day-total fix). Full
     recompute rather than an incremental patch - it sidesteps edge cases like a
@@ -250,7 +256,8 @@ def update_top_days(conn, date_str: str) -> None:
             "INSERT INTO top_days_alltime (rank, date, kwh) VALUES (?, ?, ?)",
             [(i + 1, d, k) for i, (d, k) in enumerate(alltime_rows)],
         )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def dates_needing_backfill(conn, backfill_start: date | None, stale_minutes: int,

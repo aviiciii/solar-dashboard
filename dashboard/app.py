@@ -592,18 +592,21 @@ def run_admin_backfill(conn, backfill_date: date) -> tuple[bool, str]:
 
     day_start_utc = datetime.combine(backfill_date, time.min, IST).astimezone(UTC)
     day_end_utc = day_start_utc + timedelta(days=1)
+    # One transaction for all of it (commit=False everywhere, single commit at the end):
+    # a failure partway - e.g. Turso dropping the stream - must not leave the day's
+    # readings replaced but its daily total / rankings stale.
     try:
         conn.execute("DELETE FROM readings WHERE timestamp >= ? AND timestamp < ?",
                      (day_start_utc.isoformat(), day_end_utc.isoformat()))
-        inserted = insert_rows(conn, rows)
+        inserted = insert_rows(conn, rows, commit=False)
         # overwrite=True: the replacement total may be lower than the corrupted one.
         day_totals = [r["daily_yield_kwh"] for r in rows if r["daily_yield_kwh"] is not None]
         if day_totals:
-            record_daily_total(conn, rows[-1]["timestamp"][:10], max(day_totals), overwrite=True)
+            record_daily_total(conn, rows[-1]["timestamp"][:10], max(day_totals), overwrite=True, commit=False)
         else:
             conn.execute("DELETE FROM daily_totals WHERE date = ?", (rows[-1]["timestamp"][:10],))
-            conn.commit()
-        update_top_days(conn, date_str)
+        update_top_days(conn, date_str, commit=False)
+        conn.commit()
     except Exception as e:  # noqa: BLE001 - must not leave a committed delete with no insert
         conn.rollback()
         return False, f"Backfill failed while writing to the database - rolled back, no partial changes made ({e})."
