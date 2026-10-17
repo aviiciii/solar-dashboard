@@ -62,7 +62,7 @@ def call(endpoint: str, params: dict, token: str) -> dict:
 
 if __name__ == "__main__":
     token = os.environ["POLYCAB_TOKEN"]
-    goods_id = "2620-119401326P"  # our inverter serial number
+    goods_id = os.environ["GOODS_ID"]  # inverter serial number
 
     detail = call("InverterDetailInfoNewone", {"GoodsID": goods_id}, token)
     print(json.dumps(detail, indent=2))

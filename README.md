@@ -12,14 +12,15 @@ period, 2026-07-15 to 2026-07-17) has been purged and is excluded from backfill.
 ## Architecture
 
 ```
-GitHub Actions (cron)                                    Run manually, on demand
-┌─────────────────────┐                                  ┌──────────────────────┐
-│ collector/collect.py │──┐                            ┌─▶│ dashboard/app.py      │
-└─────────────────────┘  │                             │  │ (Streamlit, planned - │
-┌─────────────────────┐  ├──▶  Turso (cloud SQLite)  ───┤  │  not yet built)       │
-│ alerts/daily_alert.py│──┘        `readings` table     │  └──────────────────────┘
-└─────────────────────┘                                 │
-         │                                               └─▶ ntfy.sh push notification
+GitHub Actions                                           Streamlit Community Cloud
+┌──────────────────────┐                                 ┌──────────────────────┐
+│ collector/collect.py  │──┐                           ┌─▶│ dashboard/app.py      │
+│ (via run_loop.py)     │  │                           │  │ (also runs locally)   │
+└──────────────────────┘  ├──▶  Turso (cloud SQLite) ──┤  └──────────────────────┘
+┌──────────────────────┐  │                           │
+│ alerts/daily_alert.py │──┘                           └─▶ ntfy.sh push notification
+└──────────────────────┘
+         │
          ▼
   pv.polycabmonitoring.com API (polycab_client.py)   +   Open-Meteo weather API (free, no key)
 ```
@@ -30,12 +31,16 @@ GitHub Actions (cron)                                    Run manually, on demand
 Shared HTTP client for the Polycab/Solarman JSON API. Handles the request-signing scheme
 (AES-256-CBC over a canonical sorted query string, reverse-engineered from the vendor's
 frontend JS bundle - see `recon/notes.md` for the full derivation) and categorizes failures
-into `AuthError` / `NetworkError` / `SchemaError`. Used by both `collector/collect.py` and
-`alerts/daily_alert.py` - don't duplicate this logic elsewhere.
+into `AuthError` / `NetworkError` / `SchemaError`. `fetch_live()` parses the inverter's
+current reading + status (including the device-clock timezone fix) for both the collector
+and the dashboard - don't duplicate this logic elsewhere. Small cross-cutting helpers
+(timezones, logging setup, % change, kWh integration) live in `common.py`.
 
 ### `collector/collect.py`
 One-shot script: poll the inverter's current reading, backfill any missing history, insert
-into Turso. Run once per invocation - a scheduler handles repetition (see below).
+into Turso. Run once per invocation - `collector/run_loop.py` repeats it every 5 minutes
+(used by `collect.yml`, and locally to cover a stretch by hand: `uv run collector/run_loop.py
+--until 17:00`).
 - Live poll: `InverterDetailInfoNewone` (AC/DC voltage/current/frequency, temperature, energy
   totals) + `GroupList` (health status).
 - Backfill: `getAllPacDay_v1` (5-min power curve) for any day since the last successful poll
@@ -57,13 +62,21 @@ One-shot script: sends a push notification (via ntfy.sh) summarizing the day.
 - Today's weather (condition, temp range, sunshine hours, cloud cover, rain) - Open-Meteo,
   no API key needed.
 
-### `dashboard/app.py` - **planned, not yet built**
-Streamlit app, run manually and stopped when done (never runs 24/7). See `AGENTS.md` for
-the full agreed design (Today tab + Month tab, data sources, and the specific decisions
-already made about temperature source, chart library, etc.) before implementing this.
+### `dashboard/app.py`
+Streamlit app, deployed on Streamlit Community Cloud (public URL in the `DASHBOARD_URL`
+secret; `collect.yml` pings it so it doesn't sleep) and runnable locally. Tabs:
+- **Today** - live snapshot from the Polycab API (power, yield, status, firmware), collector
+  health, week/month average KPIs, intraday power + cumulative-energy charts with a "this
+  week's average" overlay and an optional ambient-temperature overlay.
+- **Day** - the same charts and KPIs for any past date, from our own DB.
+- **Month** - GitHub-style calendar heatmap of daily kWh (with temperature tooltips and
+  top-10 day icons) plus the all-time top-10 table.
+- **Admin** - password-gated (`ADMIN_PASSWORD`) re-backfill of a single day, for fixing a
+  day whose readings an outage corrupted.
 
 ### `db/schema.sql`
-Tables in Turso: `readings` (the actual data, `source` column distinguishes
+Applied by `db/apply_schema.py` (once per collector job, or by hand after editing it - not
+on every poll). Tables in Turso: `readings` (the actual data, `source` column distinguishes
 `live`/`backfill` provenance), `collector_state` (singleton row for backoff bookkeeping),
 `daily_totals` (one row/day of total kWh, maintained by the collector), and
 `top_days_yearly`/`top_days_alltime` (top-10 rankings computed from `daily_totals`).
@@ -84,9 +97,12 @@ Requires [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync                          # installs deps into .venv, using pyproject.toml + uv.lock
 cp .env.example .env              # fill in real values - see the comments in that file
+uv run db/apply_schema.py          # once for a fresh DB, or after editing db/schema.sql
 uv run collector/collect.py       # one-shot: poll + backfill + insert
+uv run collector/run_loop.py      # poll every 5 min until stopped (--until HH:MM to stop)
 uv run alerts/daily_alert.py       # one-shot: send today's summary notification
-# uv run streamlit run dashboard/app.py   # once built
+uv run streamlit run dashboard/app.py
+uv run pytest                      # test suite (no network needed)
 ```
 
 `.env` is gitignored and never committed. It needs (see `.env.example` for exactly how to
@@ -99,34 +115,38 @@ obtain each of these):
 
 ## Running in GitHub Actions / the cloud
 
-Two workflows, both using `uv sync --locked` + `uv run <script>`:
+Workflows, all using `uv sync --locked` + `uv run <script>`:
 
-- **`.github/workflows/collect.yml`** - polls every 5 minutes during IST daylight hours
-  (06:00-19:00). GitHub's `schedule:` trigger is unreliable for ~150 precise firings/day, so
-  instead there are only **4 daily kickoffs**, each looping internally (real `sleep`, not
-  GitHub's queue) every 5 minutes for its ~4h15m segment. Segments **overlap by 1 hour** at
-  each boundary as redundancy against a late/missed kickoff - this means `collect.py` *will*
-  run concurrently during those windows, which is safe by design (verified: `INSERT OR
+- **`.github/workflows/collect.yml`** - polls every 5 minutes, **24/7**, as a never-ending
+  **chain of runs**: each run loops internally (`collector/run_loop.py`, real `sleep`) for
+  up to 340 min (GitHub kills jobs at 6h), then dispatches its own successor
+  (`.github/scripts/collect_handoff.sh` -> `gh workflow run`) ~10 min before its cap.
+  GitHub's `schedule:` trigger has been starting runs 3.5-4.5h late, but `workflow_dispatch`
+  starts within seconds. The every-3h `schedule:` entry only revives the chain if it ever
+  dies, exiting immediately while a chain run is active; if two chains ever coexist, the
+  older one stops at its next handoff (newest wins). Night polls are cheap no-ops - the
+  inverter is offline and its last reading just dedupes. Successive runs overlap briefly, so
+  `collect.py` *does* run concurrently with itself - safe by design (verified: `INSERT OR
   IGNORE` + an `ON CONFLICT DO UPDATE` upsert on the single `collector_state` row are both
   atomic; tested with 4 truly concurrent processes racing on the same empty data with zero
-  errors or duplicates).
+  errors or duplicates). Manual run: `gh workflow run collect.yml` polls once; `-f
+  mode=chain` starts a chain (add `-f hops=1 -f max_minutes=8` for a short test chain).
 - **`.github/workflows/daily_alert.yml`** - single daily cron at 21:00 IST (15:30 UTC). GitHub
   often starts it 1-4h late (sometimes past IST midnight), so `daily_alert.py` treats any
   run before 06:00 IST as a late run for the previous day. To re-send a specific day, run it
   manually with the `report_date` input (or `REPORT_DATE=YYYY-MM-DD` locally).
 
-Both need these **repository secrets** (Settings -> Secrets and variables -> Actions):
+They need these **repository secrets** (Settings -> Secrets and variables -> Actions):
 `POLYCAB_TOKEN`, `GOODS_ID`, `MEMBER_AUTO_ID`, `BACKFILL_START_DATE`, `TURSO_DATABASE_URL`,
-`TURSO_AUTH_TOKEN`, `NTFY_TOPIC`, `WEATHER_LAT`, `WEATHER_LON`. (`TURSO_API_TOKEN` is
+`TURSO_AUTH_TOKEN`, `NTFY_TOPIC`, `WEATHER_LAT`, `WEATHER_LON`, `DASHBOARD_URL`. (`TURSO_API_TOKEN` is
 deliberately **not** a secret here - it's a platform/management token only used for one-time
 manual provisioning, never read by any script.)
 
-Both are manually triggerable too: `gh workflow run collect.yml` / `gh workflow run
-daily_alert.yml`, or via the Actions tab.
+Both are manually triggerable too (`gh workflow run daily_alert.yml`, or the Actions tab).
 
 **`.github/workflows/keepalive.yml`** pushes an empty `keepalive: YYYY-MM` commit to `main`
 on the 1st of each month. GitHub disables scheduled workflows in public repos after 60 days
-with no repo activity, and the two workflows above don't create any. `git pull` before
+with no repo activity, and the workflows above don't create any. `git pull` before
 pushing local work.
 
 ### Weekly backup

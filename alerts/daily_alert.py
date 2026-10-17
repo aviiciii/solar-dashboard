@@ -12,12 +12,10 @@ GitHub Actions - see README). For "today" (IST calendar date) it:
 """
 
 import logging
-import logging.handlers
 import os
 import sys
 from datetime import datetime, timedelta, date
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import libsql
 import requests
@@ -25,11 +23,9 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+from common import IST, UTC, pct_change, setup_logging  # noqa: E402
 from polycab_client import call, num, MonthlyYields, AuthError, NetworkError, SchemaError  # noqa: E402
 from ntfy_client import send_ntfy  # noqa: E402
-
-IST = ZoneInfo("Asia/Kolkata")
-UTC = ZoneInfo("UTC")
 
 WMO_WEATHER_CODES = {
     0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
@@ -43,16 +39,6 @@ WMO_WEATHER_CODES = {
     85: "slight snow showers", 86: "heavy snow showers",
     95: "thunderstorm", 96: "thunderstorm with slight hail", 99: "thunderstorm with heavy hail",
 }
-
-
-def setup_logging(log_path: Path) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.handlers.RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=5)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(handler)
-    root.addHandler(logging.StreamHandler(sys.stdout))
 
 
 def peak_power_today(member_auto_id: str, token: str, today: date) -> tuple[float | None, str | None]:
@@ -141,12 +127,6 @@ def report_date(now_ist: datetime) -> date:
     if now_ist.hour < LATE_RUN_CUTOFF_HOUR:
         return now_ist.date() - timedelta(days=1)
     return now_ist.date()
-
-
-def pct_change(new: float | None, baseline: float | None) -> float | None:
-    if new is None or baseline in (None, 0):
-        return None
-    return (new - baseline) / baseline * 100
 
 
 def build_message(today: date, today_kwh, yesterday_kwh, avg7_kwh, peak_kw, peak_time,

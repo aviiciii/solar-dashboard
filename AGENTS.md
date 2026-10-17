@@ -12,10 +12,10 @@ charger - despite the portal's UI showing a "Storage" badge, this account has no
 battery hardware). Plant went live **2026-07-18**; don't reintroduce data from before that
 date (it was purged deliberately - see `README.md`).
 
-Data flow: `collector/collect.py` and `alerts/daily_alert.py` run on **GitHub Actions**
-(scheduled), writing to/reading from **Turso** (cloud SQLite, accessed via the `libsql`
-Python package). `dashboard/app.py` (Streamlit, planned, not yet built) will be run manually
-on demand, never 24/7.
+Data flow: `collector/collect.py` and `alerts/daily_alert.py` run on **GitHub Actions**,
+writing to/reading from **Turso** (cloud SQLite, accessed via the `libsql` Python package).
+`dashboard/app.py` (Streamlit) is deployed on **Streamlit Community Cloud** - a long-lived
+process kept awake by collect.yml's ping - and also runs locally.
 
 ## Things that look wrong but aren't
 
@@ -27,17 +27,29 @@ on demand, never 24/7.
   This was originally a local JSON file; it was moved to the DB specifically because the
   collector runs on ephemeral GitHub Actions runners - a local file would silently reset to
   zero every run, defeating the whole point of backoff. Don't move it back to a file.
-- **`collect.yml`'s cron fires only 4 times/day, each kicking off a ~4h15m internal loop**
-  (`sleep`-based, 5 min cadence), not ~150 separate 5-minute cron triggers. GitHub's
-  `schedule:` trigger is unreliable at that frequency (can jitter by 10s of minutes); firing
-  once and looping internally sidesteps that entirely.
-- **Those 4 segments deliberately overlap by 1 hour each**, as redundancy against a
-  late/missed kickoff. This means `collect.py` genuinely runs concurrently with itself during
-  overlaps - **verified safe**, not just assumed: `INSERT OR IGNORE` (keyed on `timestamp`)
+- **`collect.yml` is a 24/7 self-dispatching chain, not a set of cron segments.** Each run
+  loops internally (`collector/run_loop.py`, `sleep`-based, 5 min cadence) for up to 340 min
+  and then starts its successor (`.github/scripts/collect_handoff.sh`). It runs through the
+  night on purpose - night polls are cheap no-ops, and having no daily start/stop means a
+  delayed kickoff can't cost data. The earlier design - 4-5 daytime cron kickoffs of ~4h15m
+  segments overlapping by 1h - lost 1-3h of live data most mornings once GitHub's scheduler
+  started delaying every run by 3.5-4.5h (Oct 2026); `workflow_dispatch` starts within
+  seconds. The every-3h `schedule:` only revives a dead chain and no-ops while a chain run is
+  active. Don't go back to fixed cron segments.
+- **Parallel chains converge to one via newest-wins** (`collect_handoff.sh`): a run doesn't
+  dispatch a successor if a newer `workflow_dispatch` chain run is active. Scheduled runs are
+  deliberately ignored by that check (one that's about to skip itself must not also stop the
+  live chain), and runs are told apart by `run-name` ("Collect (chain)" / "Collect (once)") -
+  keep that run-name if you edit the workflow. `hops` defaults to unlimited; set it only for
+  test chains.
+- **Successive chain runs deliberately overlap ~10 min** (the successor is dispatched before
+  the predecessor's cap), and two chains can briefly coexist until they converge.
+  So `collect.py` genuinely runs concurrently with itself - **verified safe**, not just
+  assumed: `INSERT OR IGNORE` (keyed on `timestamp`)
   and the `collector_state` row's `ON CONFLICT DO UPDATE` upsert are both atomic at the DB
   level. Tested by firing 4 truly concurrent processes at the same empty data - zero errors,
   zero duplicates. There's no `concurrency:` lock in the workflow - that's intentional, adding
-  one back would force queuing instead of the intended parallel redundancy.
+  one would queue the successor behind its predecessor instead of overlapping it.
 - **The Polycab API requires a `sign` field on every request** - an AES-256-CBC scheme
   reverse-engineered from the frontend JS bundle, implemented in `polycab_client.py`. Both
   keys are hardcoded in the vendor's own frontend, not session-specific. Full derivation is
@@ -55,9 +67,9 @@ on demand, never 24/7.
 - **`InverterDetailInfoNewone`'s `DataTime` field is the device's own RTC clock, reported
   in China Standard Time (UTC+8), not the plant's actual timezone (IST, UTC+5:30).**
   Confirmed empirically: a live `DataTime` matched real-world UTC+8 clock time to within
-  ~2 minutes, but was 2.5h ahead of real IST time - both collector/collect.py (see
-  `DEVICE_CLOCK_TZ`) and dashboard/app.py's live snapshot convert it accordingly before
-  use. `getAllPacDay_v1`'s `inTime` (used for backfill) is NOT affected - it's computed
+  ~2 minutes, but was 2.5h ahead of real IST time - `polycab_client.fetch_live()` (see
+  `DEVICE_CLOCK_TZ`), which both the collector and the dashboard's live snapshot use,
+  converts it accordingly. `getAllPacDay_v1`'s `inTime` (used for backfill) is NOT affected - it's computed
   server-side from the requested date/account timezone, not the device's raw clock, and
   lines up correctly with real IST time. If a future endpoint ever surfaces another
   device-reported timestamp, verify its timezone empirically rather than assuming IST.
@@ -91,10 +103,12 @@ on demand, never 24/7.
 
 ## Key identifiers (this specific account, not generic)
 
-- `GOODS_ID` (inverter serial): `2620-119401326P`, model `PSIS-5K0`
-- `groupID` (plant/station id): `516036`
-- `MemberAutoID`: `1137916`
-- Location: Mangadu, Chennai (`WEATHER_LAT=13.016`, `WEATHER_LON=80.097`)
+This repo is public, so the account-specific values are **not** written down here - they
+live in `.env` locally and as GitHub Actions secrets: `GOODS_ID` (inverter serial, model
+`PSIS-5K0`), `MEMBER_AUTO_ID`, `WEATHER_LAT`/`WEATHER_LON` (the plant's location),
+`DASHBOARD_URL` (the Streamlit Cloud app collect.yml pings). Don't add them back to any
+tracked file - `recon/sample_responses/` uses `<PLACEHOLDER>`s for the same reason.
+
 - Panels: 5x Waaree 610W (~3.05 kWp); inverter rated capacity shown as 5kW/5000W depending
   on endpoint (known cosmetic unit inconsistency, see `recon/notes.md`)
 
@@ -107,41 +121,38 @@ on demand, never 24/7.
 - `plan.md` - original project plan. Mostly executed; historical context only at this point.
 - `README.md` - user-facing setup/run instructions for both local and GitHub Actions.
 
-## Testing approach so far
+## Testing approach
 
-No automated test suite exists. Everything has been validated by running the real scripts
-against the live Turso DB and the live Polycab API directly (see conversation history /
-commit messages for specifics: idempotency re-runs, simulated outage/gap recovery, auth
-failure -> backoff -> recovery cycles, and the 4-way concurrency race). If you add automated
-tests, keep using the real `polycab_client.call()` signing logic rather than mocking it away
-- the signing scheme is exactly the kind of thing that's easy to accidentally break in a way
-mocks wouldn't catch.
+`uv run pytest` (also runs in `.github/workflows/test.yml` on every push to main and every
+PR). The suite covers the logic that needs no network: request signing (pinned outputs of
+the real `sign()` plus a decrypt-and-check of the canonical string - never mock signing
+away, it's exactly what's easy to break in a way mocks wouldn't catch), kWh integration,
+backoff, daily-total/top-10 maintenance and transaction rollback (against an in-memory DB
+through the real `libsql` driver, which also catches named-param mistakes), run_loop's
+window/handoff planning, the daily alert's date/message logic, and backup dump/retention.
 
-## `dashboard/app.py` - agreed design, not yet implemented
+Things it can't cover are still validated by running the real scripts against the live
+Turso DB and Polycab API (see commit messages for specifics: idempotency re-runs, simulated
+outage/gap recovery, auth failure -> backoff -> recovery cycles, the 4-way concurrency race,
+and the collect.yml chain handoff, tested by dispatching a short chain on a branch).
 
-Streamlit, run manually (`streamlit run dashboard/app.py`), read-only against Turso, never
-run 24/7. Two tabs:
+## `dashboard/app.py` - design decisions worth knowing
 
-### Today tab
-| Module | Data points | Source |
-|---|---|---|
-| Current Production | current power (W), today's yield (kWh), health status, last-update time | **API** live call: `InverterDetailInfoNewone` + `GroupList` (same shape as `collect.py`'s `fetch_live_reading`) |
-| Technical Specs | inverter model, serial, firmware | **API** (same live call, no extra request) |
-| | panel count x wattage (5x610W Waaree), total kWp, install date (2026-07-18) | **Static config** - not available from the API |
-| Collector health | last successful poll timestamp, stale flag if >30 min during daylight | **DB** - `MAX(timestamp)` from `readings` |
-| Intraday production chart | 5-min power (W) for today | **DB** - `readings` filtered to today's IST date (both `live`+`backfill` rows), **fixed x-axis 06:00-19:00 IST** (confirmed - not auto-scaled to available data) |
-| Temperature overlay (toggle) | hourly ambient temp today | **Weather API** (Open-Meteo forecast endpoint) - ambient/outdoor temp, *not* inverter `temperature_c` (deliberate choice, for consistency with the Month tab's weather correlation view) |
+Four tabs: Today, Day, Month, Admin (see `README.md` for what each shows). Decisions that
+aren't obvious from the code alone:
 
-### Month tab
-| Module | Data points | Source |
-|---|---|---|
-| GitHub-style heatmap calendar | daily total kWh, one cell/day, past 12 months | **DB** - `MAX(daily_yield_kwh)` per IST day from `readings`. Days with no `live` rows render empty/no-data - expect most of the 12-month grid to be empty initially since the plant is new (2026-07-18) and the collector only started recently. This is correct, not a bug. |
-| Temperature per day (tooltip) | daily mean/max temp, past 12 months | **Weather API** (Open-Meteo **archive** endpoint - one single call for the whole year range, cache ~24h) |
-
-Chart library: **Altair** (already bundled with Streamlit, no new dependency) - needed for
-the dual-independent-y-axis overlay (`resolve_scale(y='independent')`) and for a DIY
-GitHub-style calendar heatmap (`mark_rect`, week-of-year x day-of-week grid) since Streamlit
-has no native widget for either.
-
-Caching: live API calls via `st.cache_data(ttl=60)` (so UI interactions like toggling the
-temperature overlay don't refire API calls every rerun); DB/history queries cached longer.
+- **Ambient temperature is from Open-Meteo, not the inverter's `temperature_c`** - for
+  consistency with the Month tab's weather correlation. Hourly from the forecast endpoint
+  for the last ~90 days, archive endpoint before that (archive lags ~5 days, so ranges are
+  split at that boundary - see `fetch_daily_weather_range`).
+- **Intraday charts use a fixed 06:00-19:00 IST x-axis**, not auto-scaled to the data.
+- **Timestamps are plotted as naive IST wall-clock values** - Vega-Lite can't handle IANA
+  timezones and silently drifts tz-aware values.
+- **Heatmap totals come from `daily_totals`** (never aggregated from `readings` - see the
+  rows-read note above); empty early months are expected for a plant this new.
+- **No `@st.cache_resource` on the Turso connection** - Streamlit Cloud keeps the process
+  alive for days and Turso tears idle streams down server-side ("stream not found"), so a
+  fresh connection per rerun is deliberate (see `get_conn`).
+- Charts are Altair (bundled with Streamlit); the calendar heatmap is `lesley` with custom
+  CSS so it scrolls instead of squashing on mobile.
+- Live API calls are cached `st.cache_data(ttl=60)`; DB/history queries longer.

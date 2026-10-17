@@ -1,75 +1,106 @@
 name: Collect solar readings
+run-name: Collect (${{ github.event_name == 'schedule' && 'chain' || inputs.mode }})
 
-# GitHub's `schedule:` trigger is best-effort and can jitter by many minutes,
-# which matters if you need ~150 precise firings/day (every 5 min). Instead,
-# each `schedule:` entry below only needs to fire ONCE - kicking off a job that
-# then loops internally (real `sleep`, not GH's queue) every 5 minutes for its
-# segment. A single job is capped at 6h on GitHub-hosted runners, so the
-# 06:00-19:00 IST daylight window is split into segments, each overlapping the
-# next by 1 hour - so if one kickoff is very late or never fires, the
-# neighboring segment's window already covers most of the gap.
+# Polls every 5 minutes, 24/7, as a never-ending CHAIN of runs: each run loops internally
+# (collector/run_loop.py, real `sleep`, clock-aligned) for up to 340 min - a GitHub-hosted
+# job dies at 6h - and ~10 min before that cap dispatches its own successor
+# (.github/scripts/collect_handoff.sh -> `gh workflow run`), so the two overlap briefly
+# instead of leaving a gap. Night-time polls are cheap no-ops (the inverter is offline, so
+# its last reading just dedupes), and running round the clock means there's no daily
+# start/stop boundary for a delayed kickoff to miss.
 #
-# In practice GH's scheduler has been delaying these by 2-3.5h (observed, not
-# just the "tens of minutes" jitter the 1h overlaps were originally sized for),
-# so segment 0 below exists purely as a buffer: nominally 03:00 IST, it's
-# expected to often actually fire closer to 6am given that same delay, giving
-# the real 06:00 segment a head start instead of the whole day's collection
-# starting hours late.
+# Why chain instead of one `schedule:` entry per segment: GitHub's scheduler has been
+# starting these runs 3.5-4.5h late, every day (observed Oct 2026 - far worse than the
+# "tens of minutes" of jitter fixed segments with 1h overlaps were sized for), which left a
+# 1-3h hole in live data most mornings, right at peak production. `workflow_dispatch`
+# events start within seconds, so only a chain's first link depends on the scheduler.
 #
-# Segments (IST, each entry is the kickoff/start time):
-#   0. 03:00-07:00 (240 min)  <- buffer against GH's scheduler delay, see above
-#   1. 06:00-10:15 (255 min)  <- overlaps segment 0 by 1h (06:00-07:00)
-#   2. 09:15-13:30 (255 min)  <- overlaps segment 1 by 1h (09:15-10:15)
-#   3. 12:30-16:45 (255 min)  <- overlaps segment 2 by 1h (12:30-13:30)
-#   4. 15:45-19:00 (195 min)  <- overlaps segment 3 by 1h (15:45-16:45)
-# Converted to UTC (IST = UTC+5:30) for the cron fields below.
+# The `schedule:` entries below only revive the chain if it ever dies (a failed dispatch,
+# a GitHub outage): a scheduled run exits immediately if any other chain run is active. If
+# two chains ever coexist, collect_handoff.sh's newest-wins rule ends the older one at its
+# next handoff. `hops` (default -1 = unlimited) can bound a chain - handy for testing a
+# short chain from a branch without starting one that runs forever.
 #
-# Since segments now genuinely overlap in wall-clock time, multiple runs of
-# collect.py *will* execute concurrently during those windows - verified this
-# is safe: every insert is `INSERT OR IGNORE` keyed on `timestamp`, and the
-# single-row `collector_state` upsert uses `ON CONFLICT DO UPDATE`, both of
-# which are atomic at the DB level. No concurrency lock needed here.
+# Overlapping runs mean collect.py genuinely runs concurrently with itself - verified safe:
+# every insert is `INSERT OR IGNORE` keyed on `timestamp`, and the single-row
+# `collector_state` upsert uses `ON CONFLICT DO UPDATE`, both atomic at the DB level. No
+# `concurrency:` lock - that would queue the successor instead of overlapping it.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "once = a single poll; chain = loop 24/7, handing off to successors"
+        default: once
+        type: choice
+        options: [once, chain]
+      hops:
+        description: "chain mode: successors this run may still dispatch (-1 = unlimited)"
+        default: "-1"
+      max_minutes:
+        description: "chain mode: this run's own length cap"
+        default: "340"
   schedule:
-    - cron: "30 21 * * *" # 21:30 UTC = 03:00 IST (next day) - segment 0
-    - cron: "30 0 * * *"  # 00:30 UTC = 06:00 IST - segment 1
-    - cron: "45 3 * * *"  # 03:45 UTC = 09:15 IST - segment 2
-    - cron: "0 7 * * *"   # 07:00 UTC = 12:30 IST - segment 3
-    - cron: "15 10 * * *" # 10:15 UTC = 15:45 IST - segment 4
+    - cron: "17 */3 * * *" # every 3h: revive the chain if it died (no-op while it's running)
+
+permissions:
+  contents: read
+  actions: write # list this workflow's runs + dispatch the successor
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 280  # safety net; the loop below self-limits to <= 255 min
+    timeout-minutes: 355 # GitHub-hosted hard limit is 360; run_loop.py self-limits to 340
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
+      - name: Skip if a chain is already running
+        id: guard
+        if: github.event_name == 'schedule'
+        run: |
+          others=$(gh run list --workflow collect.yml --limit 30 --json databaseId,status,displayTitle -q "
+            [.[] | select(.databaseId != ${{ github.run_id }}
+                          and (.status == \"in_progress\" or .status == \"queued\")
+                          and (.displayTitle | contains(\"chain\")))] | length")
+          if [ "$others" -gt 0 ]; then
+            echo "chain already running ($others other chain run(s) active) - nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # Streamlit Community Cloud puts the dashboard app to sleep after ~12h with no
-      # traffic. This job already runs every ~3-4h across the day (5 segments), so one
-      # ping per runner is enough to keep it awake without a dedicated schedule of its
-      # own. `--max-time 60` gives it room to actually cold-boot on the request that
-      # wakes it; failure here is non-fatal and never affects collector success/failure.
+      # traffic; one ping per run (several per day) keeps it awake without a dedicated
+      # schedule. `--max-time 60` gives it room to cold-boot on the request that wakes
+      # it; failure here is non-fatal and never affects collector success/failure.
       #
       # A bare `curl` here gets stuck in Streamlit Cloud's session-bootstrap redirect
       # (bounces through share.streamlit.io/-/auth/app without a real browser UA + cookie
       # jar to carry the Set-Cookie across hops, never reaching actual app content) -
       # confirmed by testing both ways. `-L` + a UA + a cookie jar resolves it in 3 hops.
       - name: Ping dashboard to prevent Streamlit Cloud sleep
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
         run: |
+          [ -n "$DASHBOARD_URL" ] || { echo "DASHBOARD_URL secret not set, skipping"; exit 0; }
           curl -sL --max-redirs 15 --max-time 60 -o /dev/null \
             -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36" \
             -c /tmp/streamlit_cookies.txt -b /tmp/streamlit_cookies.txt \
             -w "dashboard ping: HTTP %{http_code} after %{num_redirects} redirect(s)\n" \
-            https://homesolar.streamlit.app/ || echo "::warning::dashboard ping failed, continuing"
+            "$DASHBOARD_URL" || echo "::warning::dashboard ping failed, continuing"
 
       - uses: actions/checkout@v7
+        if: steps.guard.outputs.skip != 'true'
 
       - uses: astral-sh/setup-uv@v8.3.2
+        if: steps.guard.outputs.skip != 'true'
         with:
           enable-cache: true
 
       - run: uv sync --locked
+        if: steps.guard.outputs.skip != 'true'
 
-      - name: Poll every 5 minutes for this segment
+      - name: Collect
+        if: steps.guard.outputs.skip != 'true'
         env:
           POLYCAB_TOKEN: ${{ secrets.POLYCAB_TOKEN }}
           GOODS_ID: ${{ secrets.GOODS_ID }}
@@ -78,52 +109,22 @@ jobs:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          SCHEDULE: ${{ github.event.schedule }}
+          MODE: ${{ github.event_name == 'schedule' && 'chain' || inputs.mode }}
+          HOPS: ${{ inputs.hops || '-1' }}
+          MAX_MINUTES: ${{ inputs.max_minutes || '340' }}
         run: |
-          case "$SCHEDULE" in
-            "30 21 * * *") duration_min=240 ;;
-            "30 0 * * *")  duration_min=255 ;;
-            "45 3 * * *")  duration_min=255 ;;
-            "0 7 * * *")   duration_min=255 ;;
-            "15 10 * * *") duration_min=195 ;;
-            *) duration_min=0 ;;  # manual workflow_dispatch: just run once
-          esac
+          uv run db/apply_schema.py  # once per job; collect.py doesn't re-run it every poll
 
           # collect.py exit codes: 0 ok, 1 transient network failure (self-heals, don't
-          # fail the job over it), 2 auth failure, 3 API schema change - the last two
-          # need a human, so they fail this job (collect.py itself already sent an ntfy
-          # alert), even though the loop keeps polling for the rest of the segment in
-          # case it's a one-off blip or gets fixed mid-run.
-          needs_human=0
-
-          if [ "$duration_min" -eq 0 ]; then
-            uv run collector/collect.py || { code=$?; [ "$code" -ge 2 ] && needs_human=1; }
-          else
-            end_time=$(( $(date +%s) + duration_min * 60 ))
-            interval=300
-            # Align every cycle to a real clock boundary (:00/:05/:10/...) rather than
-            # whatever second the segment happened to kick off at - 300 divides evenly
-            # into a day, so (epoch / interval + 1) * interval always lands exactly on
-            # one, in both UTC and IST (IST's +5:30 offset is itself a multiple of 5 min).
-            while true; do
-              now=$(date +%s)
-              target=$(( (now / interval + 1) * interval ))
-              if [ "$target" -gt "$end_time" ]; then
-                break
-              fi
-              sleep_for=$(( target - now ))
-              if [ "$sleep_for" -gt 0 ]; then
-                sleep "$sleep_for"
-              fi
-              uv run collector/collect.py || {
-                code=$?
-                echo "::warning::collect.py exited $code this cycle, continuing loop"
-                [ "$code" -ge 2 ] && needs_human=1
-              }
-            done
+          # fail the job over it), 2 auth failure, 3 API schema change - the last two need
+          # a human (collect.py already sent an ntfy alert), so they fail the job.
+          if [ "$MODE" != "chain" ]; then
+            uv run collector/collect.py || { code=$?; [ "$code" -lt 2 ] || exit 1; }
+            exit 0
           fi
 
-          if [ "$needs_human" -eq 1 ]; then
-            echo "::error::collector hit an auth failure or API schema change this segment - failing the job"
-            exit 1
+          handoff=()
+          if [ "$HOPS" -ne 0 ]; then
+            handoff=(--handoff-cmd "bash .github/scripts/collect_handoff.sh")
           fi
+          uv run collector/run_loop.py --max-minutes "$MAX_MINUTES" "${handoff[@]}"

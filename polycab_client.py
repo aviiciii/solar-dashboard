@@ -5,7 +5,9 @@ the signing scheme was reverse-engineered.
 """
 
 import base64
-from datetime import date
+import logging
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import requests
 from Crypto.Cipher import AES
@@ -16,6 +18,16 @@ BASE_URL = "https://pv.polycabmonitoring.com/dist/server/api/CodeIgniter/index.p
 # Hardcoded in the frontend JS bundle (umi.*.js) - not session-specific.
 _SIGN_KEY1 = "05469137076236813460585715952089"
 _SIGN_KEY2 = "5161557162012237"
+
+# InverterDetailInfoNewone's DataTime field is the device's own RTC clock, reported in
+# China Standard Time (UTC+8) regardless of the plant's actual location/configured
+# timezone (+5:30) - confirmed empirically: a live DataTime matched real-world UTC+8
+# clock time to within ~2 minutes, but was 2.5h ahead of real IST time. getAllPacDay_v1's
+# `inTime` (used for backfill) is genuinely IST - it's parameterized by date/account
+# timezone server-side, not the raw device clock, and lines up correctly with real time.
+DEVICE_CLOCK_TZ = ZoneInfo("Asia/Shanghai")
+
+STATUS_BY_COLOR = {"Green": "normal", "yellow": "standby", "red": "abnormal", "gray": "offline"}
 
 
 class AuthError(Exception):
@@ -120,3 +132,47 @@ class MonthlyYields:
 
     def yield_for(self, d: date) -> float | None:
         return self._month(d.year, d.month).get(d.isoformat())
+
+
+def fetch_live(goods_id: str, member_auto_id: str, token: str) -> dict:
+    """The inverter's current reading (InverterDetailInfoNewone) plus health status
+    (GroupList), parsed - shared by the collector's live poll and the dashboard's live
+    snapshot. Energy totals are converted Wh -> kWh; `reported_at` is the device's DataTime
+    as an aware datetime (see DEVICE_CLOCK_TZ); `detail` is the raw response."""
+    detail = call("InverterDetailInfoNewone", {"GoodsID": goods_id}, token)
+    try:
+        ac = detail["ACDCInfo"]
+        data_time_str = detail["DataTime"]
+    except KeyError as e:
+        raise SchemaError(f"InverterDetailInfoNewone: missing expected field {e}") from e
+    reported_at = datetime.strptime(data_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=DEVICE_CLOCK_TZ)
+
+    status = None
+    try:
+        group_list = call("GroupList", {"MemberAutoID": member_auto_id, "inputValue": ""}, token)
+        inv_status = group_list["AllGroupList"][0]["InverterStatus"]
+        active_color = next((c for c, n in inv_status.items() if n), None)
+        status = STATUS_BY_COLOR.get(active_color)
+    except (AuthError, NetworkError):
+        raise  # these matter - propagate
+    except Exception as e:  # noqa: BLE001 - status is best-effort, never fail the whole poll over it
+        logging.warning("could not determine status from GroupList: %s", e)
+
+    def first(arr):
+        return num(arr[0]) if arr else None
+
+    daily_wh = num(detail.get("EToday"))
+    total_wh = num(detail.get("ETotal"))
+    return {
+        "reported_at": reported_at,
+        "pv_power_w": first(ac.get("Pac")),
+        "daily_yield_kwh": daily_wh / 1000 if daily_wh is not None else None,
+        "total_yield_kwh": total_wh / 1000 if total_wh is not None else None,
+        "ac_voltage": first(ac.get("Vac")),
+        "ac_current": first(ac.get("Iac")),
+        "ac_frequency": first(ac.get("Fac")),
+        "temperature_c": num(detail.get("Tntc")),
+        "status": status,
+        "firmware": {k: detail.get(f"{k}Version") for k in ("MDSP", "SDSP", "CSB")},
+        "detail": detail,
+    }

@@ -26,31 +26,20 @@ loop (unlike exit 1, which the loop logs and continues past).
 
 import json
 import logging
-import logging.handlers
 import os
 import sys
 from datetime import datetime, timedelta, date
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import libsql
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from polycab_client import call, num, MonthlyYields, AuthError, NetworkError, SchemaError  # noqa: E402
+from common import IST, UTC, cumulative_kwh, setup_logging  # noqa: E402
+from polycab_client import (call, fetch_live, num, MonthlyYields, AuthError, NetworkError,  # noqa: E402
+                            SchemaError)
 from ntfy_client import send_ntfy  # noqa: E402
-
-IST = ZoneInfo("Asia/Kolkata")
-# InverterDetailInfoNewone's DataTime field is the device's own RTC clock, reported in
-# China Standard Time (UTC+8) regardless of the plant's actual location/configured
-# timezone (+5:30) - confirmed empirically: a live DataTime matched real-world UTC+8
-# clock time to within ~2 minutes, but was 2.5h ahead of real IST time. getAllPacDay_v1's
-# `inTime` (used for backfill) is genuinely IST - it's parameterized by date/account
-# timezone server-side, not the raw device clock, and lines up correctly with real time.
-DEVICE_CLOCK_TZ = ZoneInfo("Asia/Shanghai")
-
-STATUS_BY_COLOR = {"Green": "normal", "yellow": "standby", "red": "abnormal", "gray": "offline"}
 
 
 def alert_once_per_failure_streak(ntfy_topic: str, was_already_failing: bool, title: str, message: str) -> None:
@@ -65,69 +54,27 @@ def alert_once_per_failure_streak(ntfy_topic: str, was_already_failing: bool, ti
         logging.warning("could not send ntfy alert: %s", e)
 
 
-def to_utc_iso(local_dt: datetime, tz: ZoneInfo = IST) -> str:
-    return local_dt.replace(tzinfo=tz).astimezone(ZoneInfo("UTC")).isoformat()
+def to_utc_iso(local_dt: datetime) -> str:
+    return local_dt.replace(tzinfo=IST).astimezone(UTC).isoformat()
 
 
 def fetch_live_reading(goods_id: str, member_auto_id: str, token: str) -> dict:
-    detail = call("InverterDetailInfoNewone", {"GoodsID": goods_id}, token)
-    try:
-        ac = detail["ACDCInfo"]
-        data_time_str = detail["DataTime"]
-    except KeyError as e:
-        raise SchemaError(f"InverterDetailInfoNewone: missing expected field {e}") from e
-
-    local_dt = datetime.strptime(data_time_str, "%Y-%m-%d %H:%M:%S")
-    timestamp = to_utc_iso(local_dt, tz=DEVICE_CLOCK_TZ)
-
-    status = None
-    try:
-        group_list = call("GroupList", {"MemberAutoID": member_auto_id, "inputValue": ""}, token)
-        inv_status = group_list["AllGroupList"][0]["InverterStatus"]
-        active_color = next((c for c, n in inv_status.items() if n), None)
-        status = STATUS_BY_COLOR.get(active_color)
-    except (AuthError, NetworkError):
-        raise  # these matter - propagate
-    except Exception as e:  # noqa: BLE001 - status is best-effort, never fail the whole poll over it
-        logging.warning("could not determine status from GroupList: %s", e)
-
-    def first(arr):
-        return num(arr[0]) if arr else None
-
-    daily_yield = num(detail.get("EToday"))
-    total_yield = num(detail.get("ETotal"))
-
+    live = fetch_live(goods_id, member_auto_id, token)
     return {
-        "timestamp": timestamp,
-        "pv_power_w": first(ac.get("Pac")),
-        "daily_yield_kwh": daily_yield / 1000 if daily_yield is not None else None,
-        "total_yield_kwh": total_yield / 1000 if total_yield is not None else None,
-        "ac_voltage": first(ac.get("Vac")),
-        "ac_current": first(ac.get("Iac")),
-        "ac_frequency": first(ac.get("Fac")),
-        "temperature_c": num(detail.get("Tntc")),
-        "status": status,
+        "timestamp": live["reported_at"].astimezone(UTC).isoformat(),
+        **{col: live[col] for col in ("pv_power_w", "daily_yield_kwh", "total_yield_kwh", "ac_voltage",
+                                      "ac_current", "ac_frequency", "temperature_c", "status")},
         "source": "live",
-        "raw_json": json.dumps(detail),
+        "raw_json": json.dumps(live["detail"]),
     }
 
 
 def integrate_kwh(rows: list[dict]) -> float:
-    """Trapezoidal-rule integration of a chronological list of backfill row dicts'
-    pv_power_w over time -> total kWh. Used as a fallback day total (see
-    fetch_backfill_day) - same approximation as dashboard/app.py's add_cumulative_kwh,
-    just operating on row dicts instead of a DataFrame since that's what this module
-    works with before insertion."""
-    total_kwh = 0.0
-    prev_dt, prev_w = None, None
-    for row in rows:
-        dt = datetime.fromisoformat(row["timestamp"])
-        w = row["pv_power_w"] or 0
-        if prev_dt is not None:
-            hours = (dt - prev_dt).total_seconds() / 3600
-            total_kwh += hours * (w + prev_w) / 2 / 1000
-        prev_dt, prev_w = dt, w
-    return total_kwh
+    """Total kWh under a chronological list of row dicts' pv_power_w - the fallback day
+    total in fetch_backfill_day. Same integration as the dashboard's cumulative charts
+    (common.cumulative_kwh)."""
+    totals = cumulative_kwh([(datetime.fromisoformat(r["timestamp"]), r["pv_power_w"]) for r in rows])
+    return totals[-1] if totals else 0.0
 
 
 def fetch_backfill_day(date_str: str, member_auto_id: str, token: str, monthly_yields: MonthlyYields) -> list[dict]:
@@ -183,9 +130,13 @@ _READING_COLUMNS = [
 ]
 
 
-def insert_rows(conn, rows: list[dict]) -> int:
+def insert_rows(conn, rows: list[dict], commit: bool = True) -> int:
     """libsql (unlike sqlite3) only supports positional `?` params, not named `:key`
-    ones - so rows are converted to tuples in _READING_COLUMNS order here."""
+    ones - so rows are converted to tuples in _READING_COLUMNS order here.
+
+    commit=False (here and in record_daily_total / update_top_days) leaves the write in
+    the caller's open transaction - the Admin tab's re-backfill uses it to make its
+    delete + reinsert + totals + rankings a single all-or-nothing commit."""
     if not rows:
         return 0
     placeholders = ", ".join("?" for _ in _READING_COLUMNS)
@@ -194,18 +145,19 @@ def insert_rows(conn, rows: list[dict]) -> int:
         f"INSERT OR IGNORE INTO readings ({', '.join(_READING_COLUMNS)}) VALUES ({placeholders})",
         values,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.rowcount
 
 
-def record_daily_total(conn, date_str: str, kwh: float, overwrite: bool = False) -> bool:
+def record_daily_total(conn, date_str: str, kwh: float, overwrite: bool = False, commit: bool = True) -> bool:
     """Upserts one day's total into daily_totals and reports whether it actually
     changed - callers skip update_top_days() when it didn't (e.g. an idle overnight
     poll re-reporting the same EToday), which is most of the collector's read savings.
 
     Default mode only ever raises a day's total (`MAX` semantics, same as the old
     `MAX(daily_yield_kwh)` aggregation over `readings`), and the conditional DO UPDATE
-    is atomic, so it's safe under collect.yml's deliberately-overlapping segments.
+    is atomic, so it's safe under collect.yml's deliberately-overlapping runs.
     `overwrite=True` is for the Admin tab's re-backfill, which can legitimately lower a
     day's total when replacing corrupted readings."""
     condition = "excluded.kwh IS NOT daily_totals.kwh" if overwrite else "excluded.kwh > daily_totals.kwh"
@@ -214,43 +166,58 @@ def record_daily_total(conn, date_str: str, kwh: float, overwrite: bool = False)
         f"ON CONFLICT (date) DO UPDATE SET kwh = excluded.kwh WHERE {condition}",
         (date_str, kwh),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.rowcount > 0
 
 
-def update_top_days(conn, date_str: str) -> None:
-    """Fully recomputes both the affected year's top-10 and the all-time top-10
-    whenever a day's total changed (a live poll or a backfill's day-total fix). Full
-    recompute rather than an incremental patch - it sidesteps edge cases like a
-    backfill correcting an earlier day's total after it was already ranked.
+def update_top_days(conn, date_str: str, commit: bool = True) -> int:
+    """Recomputes both the affected year's top-10 and the all-time top-10 whenever a
+    day's total changed (a live poll or a backfill's day-total fix), then writes only the
+    ranks whose (date, kwh) actually differ - returns how many rows were written. Full
+    recompute rather than an incremental patch sidesteps edge cases like a backfill
+    correcting an earlier day's total after it was already ranked; diffing the write
+    avoids rewriting all 20 rows on every poll (that was ~95% of the DB's rows written,
+    since today's total rises on nearly every daylight poll).
 
     Reads only daily_totals (one row/day, date-range and kwh-indexed), never
     `readings`: aggregating per-day totals out of `readings` needs a full-table scan,
     which on every poll burned ~400M Turso rows-read/month (see db/schema.sql)."""
     year = date.fromisoformat(date_str).year
 
-    yearly_rows = conn.execute(
+    desired_yearly = conn.execute(
         "SELECT date, kwh FROM daily_totals WHERE date >= ? AND date < ? "
         "ORDER BY kwh DESC, date LIMIT 10",
         (f"{year:04d}-01-01", f"{year + 1:04d}-01-01"),
     ).fetchall()
-    conn.execute("DELETE FROM top_days_yearly WHERE year = ?", (year,))
-    if yearly_rows:
-        conn.executemany(
-            "INSERT INTO top_days_yearly (year, rank, date, kwh) VALUES (?, ?, ?, ?)",
-            [(year, i + 1, d, k) for i, (d, k) in enumerate(yearly_rows)],
-        )
+    current_yearly = {r: (d, k) for r, d, k in conn.execute(
+        "SELECT rank, date, kwh FROM top_days_yearly WHERE year = ?", (year,)).fetchall()}
+    yearly_changes = [(year, rank, d, k) for rank, (d, k) in enumerate(desired_yearly, 1)
+                      if current_yearly.get(rank) != (d, k)]
+    if yearly_changes:
+        conn.executemany("INSERT OR REPLACE INTO top_days_yearly (year, rank, date, kwh) VALUES (?, ?, ?, ?)",
+                         yearly_changes)
+    yearly_dropped = sum(1 for rank in current_yearly if rank > len(desired_yearly))
+    if yearly_dropped:
+        conn.execute("DELETE FROM top_days_yearly WHERE year = ? AND rank > ?", (year, len(desired_yearly)))
 
-    alltime_rows = conn.execute(
+    desired_alltime = conn.execute(
         "SELECT date, kwh FROM daily_totals ORDER BY kwh DESC, date LIMIT 10",
     ).fetchall()
-    conn.execute("DELETE FROM top_days_alltime")
-    if alltime_rows:
-        conn.executemany(
-            "INSERT INTO top_days_alltime (rank, date, kwh) VALUES (?, ?, ?)",
-            [(i + 1, d, k) for i, (d, k) in enumerate(alltime_rows)],
-        )
-    conn.commit()
+    current_alltime = {r: (d, k) for r, d, k in conn.execute(
+        "SELECT rank, date, kwh FROM top_days_alltime").fetchall()}
+    alltime_changes = [(rank, d, k) for rank, (d, k) in enumerate(desired_alltime, 1)
+                       if current_alltime.get(rank) != (d, k)]
+    if alltime_changes:
+        conn.executemany("INSERT OR REPLACE INTO top_days_alltime (rank, date, kwh) VALUES (?, ?, ?)",
+                         alltime_changes)
+    alltime_dropped = sum(1 for rank in current_alltime if rank > len(desired_alltime))
+    if alltime_dropped:
+        conn.execute("DELETE FROM top_days_alltime WHERE rank > ?", (len(desired_alltime),))
+
+    if commit:
+        conn.commit()
+    return len(yearly_changes) + yearly_dropped + len(alltime_changes) + alltime_dropped
 
 
 def dates_needing_backfill(conn, backfill_start: date | None, stale_minutes: int,
@@ -270,7 +237,7 @@ def dates_needing_backfill(conn, backfill_start: date | None, stale_minutes: int
     needs_today = (
         last_local_date is None
         or last_local_date < today_local
-        or (datetime.now(ZoneInfo("UTC")) - last_ts_utc) > timedelta(minutes=stale_minutes)
+        or (datetime.now(UTC) - last_ts_utc) > timedelta(minutes=stale_minutes)
     )
 
     days = gap_days + ([today_local.isoformat()] if needs_today else [])
@@ -312,16 +279,6 @@ def backoff_minutes_for(consecutive_failures: int) -> int:
     return min(5 * (2 ** (consecutive_failures - 1)), 60)
 
 
-def setup_logging(log_path: Path) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.handlers.RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=5)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(handler)
-    root.addHandler(logging.StreamHandler(sys.stdout))
-
-
 def main() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
 
@@ -344,20 +301,20 @@ def main() -> int:
                        "TURSO_DATABASE_URL / TURSO_AUTH_TOKEN")
         return 1
 
+    # Schema is applied once per workflow job by db/apply_schema.py, not on every poll.
     conn = libsql.connect(turso_url, auth_token=turso_token)
-    conn.executescript((PROJECT_ROOT / "db" / "schema.sql").read_text())
 
     state = load_backoff_state(conn)
     if state["consecutive_failures"] > 0 and state["last_attempt"]:
         cooldown = backoff_minutes_for(state["consecutive_failures"])
-        elapsed = datetime.now(ZoneInfo("UTC")) - datetime.fromisoformat(state["last_attempt"])
+        elapsed = datetime.now(UTC) - datetime.fromisoformat(state["last_attempt"])
         if elapsed < timedelta(minutes=cooldown):
             logging.warning("in backoff after %d consecutive failures, skipping this cycle "
                              "(retry in %.0f min)", state["consecutive_failures"],
                              (timedelta(minutes=cooldown) - elapsed).total_seconds() / 60)
             return 0
 
-    state["last_attempt"] = datetime.now(ZoneInfo("UTC")).isoformat()
+    state["last_attempt"] = datetime.now(UTC).isoformat()
 
     try:
         monthly_yields = MonthlyYields(member_auto_id, token)

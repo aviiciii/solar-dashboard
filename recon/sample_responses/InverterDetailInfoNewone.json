@@ -34,7 +34,7 @@
   "CSBVersion": "CN0000",
   "ESP32Version": {
     "Version": "050400-10_012006",
-    "SN": "M32620-9039527EP",
+    "SN": "<DATALOGGER_SN>",
     "Status": "Offline"
   },
   "ModbusVersion": "-"

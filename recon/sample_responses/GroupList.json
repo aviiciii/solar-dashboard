@@ -7,8 +7,8 @@
         "red": 0,
         "gray": 1
       },
-      "AutoID": "516036",
-      "GoodsTypeName": "Parthiban",
+      "AutoID": "<GROUP_ID>",
+      "GoodsTypeName": "<PLANT_NAME>",
       "GreenPercent": 0,
       "Light": 4,
       "CurrPac": 0,
