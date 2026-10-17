@@ -91,10 +91,12 @@ on demand, never 24/7.
 
 ## Key identifiers (this specific account, not generic)
 
-- `GOODS_ID` (inverter serial): `2620-119401326P`, model `PSIS-5K0`
-- `groupID` (plant/station id): `516036`
-- `MemberAutoID`: `1137916`
-- Location: Mangadu, Chennai (`WEATHER_LAT=13.016`, `WEATHER_LON=80.097`)
+This repo is public, so the account-specific values are **not** written down here - they
+live in `.env` locally and as GitHub Actions secrets: `GOODS_ID` (inverter serial, model
+`PSIS-5K0`), `MEMBER_AUTO_ID`, `WEATHER_LAT`/`WEATHER_LON` (the plant's location),
+`DASHBOARD_URL` (the Streamlit Cloud app collect.yml pings). Don't add them back to any
+tracked file - `recon/sample_responses/` uses `<PLACEHOLDER>`s for the same reason.
+
 - Panels: 5x Waaree 610W (~3.05 kWp); inverter rated capacity shown as 5kW/5000W depending
   on endpoint (known cosmetic unit inconsistency, see `recon/notes.md`)
 

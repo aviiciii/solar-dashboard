@@ -20,7 +20,7 @@ All requests are `POST` with a JSON body.
 ## Request signing
 Every request body includes a `sign` field alongside the real params, e.g.:
 ```json
-{"sign": "zTWZ...==", "groupID": "516036", "date": "2026-07-20"}
+{"sign": "zTWZ...==", "groupID": "<GROUP_ID>", "date": "2026-07-20"}
 ```
 This **is validated server-side** (confirmed: flipping one character of a valid `sign` while
 keeping everything else identical causes a 404). Reverse-engineered from the frontend bundle
@@ -39,9 +39,14 @@ Both keys are hardcoded in the frontend JS bundle, not session-specific. Verifie
 against a real captured request (see `recon/api_client.py::sign`).
 
 ## Key identifiers for our system
-- `MemberAutoID`: `1137916` (account: "Mr.Parthiban")
-- `groupID` (plant/station id): `516036` (plant name "Parthiban", address "Mangadu")
-- `GoodsID` (inverter serial number): `2620-119401326P` (model `PSIS-5K0`)
+Kept out of this (public) repo - the real values live in `.env` / GitHub Actions secrets:
+- `MemberAutoID` -> `MEMBER_AUTO_ID`
+- `groupID` (plant/station id) - not used by any script; it's `AllGroupList[].AutoID` in a
+  `GroupList` response
+- `GoodsID` (inverter serial number, model `PSIS-5K0`) -> `GOODS_ID`
+
+Sample responses under `sample_responses/` have these (and the plant name / datalogger
+serial) replaced with `<PLACEHOLDER>`s.
 
 ## Useful endpoints found
 | Endpoint | Params | Gives us |

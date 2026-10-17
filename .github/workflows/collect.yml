@@ -84,12 +84,15 @@ jobs:
       # confirmed by testing both ways. `-L` + a UA + a cookie jar resolves it in 3 hops.
       - name: Ping dashboard to prevent Streamlit Cloud sleep
         if: steps.guard.outputs.skip != 'true'
+        env:
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
         run: |
+          [ -n "$DASHBOARD_URL" ] || { echo "DASHBOARD_URL secret not set, skipping"; exit 0; }
           curl -sL --max-redirs 15 --max-time 60 -o /dev/null \
             -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36" \
             -c /tmp/streamlit_cookies.txt -b /tmp/streamlit_cookies.txt \
             -w "dashboard ping: HTTP %{http_code} after %{num_redirects} redirect(s)\n" \
-            https://homesolar.streamlit.app/ || echo "::warning::dashboard ping failed, continuing"
+            "$DASHBOARD_URL" || echo "::warning::dashboard ping failed, continuing"
 
       - uses: actions/checkout@v7
         if: steps.guard.outputs.skip != 'true'
