@@ -121,6 +121,8 @@ jobs:
           START: ${{ inputs.start || '05:30' }}
           UNTIL: ${{ inputs.until || '19:00' }}
         run: |
+          uv run db/apply_schema.py  # once per job; collect.py doesn't re-run it every poll
+
           # collect.py exit codes: 0 ok, 1 transient network failure (self-heals, don't
           # fail the job over it), 2 auth failure, 3 API schema change - the last two need
           # a human (collect.py already sent an ntfy alert), so they fail the job.

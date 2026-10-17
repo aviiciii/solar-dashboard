@@ -75,7 +75,8 @@ secret; `collect.yml` pings it so it doesn't sleep) and runnable locally. Tabs:
   day whose readings an outage corrupted.
 
 ### `db/schema.sql`
-Tables in Turso: `readings` (the actual data, `source` column distinguishes
+Applied by `db/apply_schema.py` (once per collector job, or by hand after editing it - not
+on every poll). Tables in Turso: `readings` (the actual data, `source` column distinguishes
 `live`/`backfill` provenance), `collector_state` (singleton row for backoff bookkeeping),
 `daily_totals` (one row/day of total kWh, maintained by the collector), and
 `top_days_yearly`/`top_days_alltime` (top-10 rankings computed from `daily_totals`).
@@ -96,6 +97,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync                          # installs deps into .venv, using pyproject.toml + uv.lock
 cp .env.example .env              # fill in real values - see the comments in that file
+uv run db/apply_schema.py          # once for a fresh DB, or after editing db/schema.sql
 uv run collector/collect.py       # one-shot: poll + backfill + insert
 uv run collector/run_loop.py      # poll every 5 min until 19:00 IST
 uv run alerts/daily_alert.py       # one-shot: send today's summary notification

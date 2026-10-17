@@ -301,8 +301,8 @@ def main() -> int:
                        "TURSO_DATABASE_URL / TURSO_AUTH_TOKEN")
         return 1
 
+    # Schema is applied once per workflow job by db/apply_schema.py, not on every poll.
     conn = libsql.connect(turso_url, auth_token=turso_token)
-    conn.executescript((PROJECT_ROOT / "db" / "schema.sql").read_text())
 
     state = load_backoff_state(conn)
     if state["consecutive_failures"] > 0 and state["last_attempt"]:
