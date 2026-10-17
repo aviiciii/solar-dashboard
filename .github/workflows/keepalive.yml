@@ -1,0 +1,26 @@
+name: Keepalive
+
+# GitHub auto-disables scheduled workflows in a PUBLIC repo after 60 days with no repo
+# activity - and nothing collect.yml / daily_alert.yml do counts as activity (they write
+# to Turso, not here). One empty commit a month keeps the repo "active" so they never stop.
+# Expect a "keepalive" commit on main each month: `git pull` before pushing local work.
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 6 1 * *" # 06:00 UTC on the 1st of each month
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "keepalive: $(date -u +%Y-%m)"
+          git push

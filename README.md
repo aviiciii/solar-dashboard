@@ -124,6 +124,11 @@ manual provisioning, never read by any script.)
 Both are manually triggerable too: `gh workflow run collect.yml` / `gh workflow run
 daily_alert.yml`, or via the Actions tab.
 
+**`.github/workflows/keepalive.yml`** pushes an empty `keepalive: YYYY-MM` commit to `main`
+on the 1st of each month. GitHub disables scheduled workflows in public repos after 60 days
+with no repo activity, and the two workflows above don't create any. `git pull` before
+pushing local work.
+
 ### Weekly backup
 
 The workflow lives in the **private** `aviiciii/solar-dashboard-backups` repo, not here

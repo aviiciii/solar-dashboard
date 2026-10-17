@@ -85,6 +85,10 @@ on demand, never 24/7.
   don't swap it for `TURSO_AUTH_TOKEN`. It reads every row once per week (rowid keyset
   pages), which is fine for the rows-read cap at weekly cadence - don't run it per-poll.
 
+- **The monthly empty "keepalive" commits on `main` are deliberate** (`keepalive.yml`).
+  GitHub auto-disables scheduled workflows in public repos after 60 days without repo
+  activity, and the collector/alert writing to Turso doesn't count. Don't remove it.
+
 ## Key identifiers (this specific account, not generic)
 
 - `GOODS_ID` (inverter serial): `2620-119401326P`, model `PSIS-5K0`
