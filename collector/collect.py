@@ -171,40 +171,53 @@ def record_daily_total(conn, date_str: str, kwh: float, overwrite: bool = False,
     return cur.rowcount > 0
 
 
-def update_top_days(conn, date_str: str, commit: bool = True) -> None:
-    """Fully recomputes both the affected year's top-10 and the all-time top-10
-    whenever a day's total changed (a live poll or a backfill's day-total fix). Full
-    recompute rather than an incremental patch - it sidesteps edge cases like a
-    backfill correcting an earlier day's total after it was already ranked.
+def update_top_days(conn, date_str: str, commit: bool = True) -> int:
+    """Recomputes both the affected year's top-10 and the all-time top-10 whenever a
+    day's total changed (a live poll or a backfill's day-total fix), then writes only the
+    ranks whose (date, kwh) actually differ - returns how many rows were written. Full
+    recompute rather than an incremental patch sidesteps edge cases like a backfill
+    correcting an earlier day's total after it was already ranked; diffing the write
+    avoids rewriting all 20 rows on every poll (that was ~95% of the DB's rows written,
+    since today's total rises on nearly every daylight poll).
 
     Reads only daily_totals (one row/day, date-range and kwh-indexed), never
     `readings`: aggregating per-day totals out of `readings` needs a full-table scan,
     which on every poll burned ~400M Turso rows-read/month (see db/schema.sql)."""
     year = date.fromisoformat(date_str).year
 
-    yearly_rows = conn.execute(
+    desired_yearly = conn.execute(
         "SELECT date, kwh FROM daily_totals WHERE date >= ? AND date < ? "
         "ORDER BY kwh DESC, date LIMIT 10",
         (f"{year:04d}-01-01", f"{year + 1:04d}-01-01"),
     ).fetchall()
-    conn.execute("DELETE FROM top_days_yearly WHERE year = ?", (year,))
-    if yearly_rows:
-        conn.executemany(
-            "INSERT INTO top_days_yearly (year, rank, date, kwh) VALUES (?, ?, ?, ?)",
-            [(year, i + 1, d, k) for i, (d, k) in enumerate(yearly_rows)],
-        )
+    current_yearly = {r: (d, k) for r, d, k in conn.execute(
+        "SELECT rank, date, kwh FROM top_days_yearly WHERE year = ?", (year,)).fetchall()}
+    yearly_changes = [(year, rank, d, k) for rank, (d, k) in enumerate(desired_yearly, 1)
+                      if current_yearly.get(rank) != (d, k)]
+    if yearly_changes:
+        conn.executemany("INSERT OR REPLACE INTO top_days_yearly (year, rank, date, kwh) VALUES (?, ?, ?, ?)",
+                         yearly_changes)
+    yearly_dropped = sum(1 for rank in current_yearly if rank > len(desired_yearly))
+    if yearly_dropped:
+        conn.execute("DELETE FROM top_days_yearly WHERE year = ? AND rank > ?", (year, len(desired_yearly)))
 
-    alltime_rows = conn.execute(
+    desired_alltime = conn.execute(
         "SELECT date, kwh FROM daily_totals ORDER BY kwh DESC, date LIMIT 10",
     ).fetchall()
-    conn.execute("DELETE FROM top_days_alltime")
-    if alltime_rows:
-        conn.executemany(
-            "INSERT INTO top_days_alltime (rank, date, kwh) VALUES (?, ?, ?)",
-            [(i + 1, d, k) for i, (d, k) in enumerate(alltime_rows)],
-        )
+    current_alltime = {r: (d, k) for r, d, k in conn.execute(
+        "SELECT rank, date, kwh FROM top_days_alltime").fetchall()}
+    alltime_changes = [(rank, d, k) for rank, (d, k) in enumerate(desired_alltime, 1)
+                       if current_alltime.get(rank) != (d, k)]
+    if alltime_changes:
+        conn.executemany("INSERT OR REPLACE INTO top_days_alltime (rank, date, kwh) VALUES (?, ?, ?)",
+                         alltime_changes)
+    alltime_dropped = sum(1 for rank in current_alltime if rank > len(desired_alltime))
+    if alltime_dropped:
+        conn.execute("DELETE FROM top_days_alltime WHERE rank > ?", (len(desired_alltime),))
+
     if commit:
         conn.commit()
+    return len(yearly_changes) + yearly_dropped + len(alltime_changes) + alltime_dropped
 
 
 def dates_needing_backfill(conn, backfill_start: date | None, stale_minutes: int,

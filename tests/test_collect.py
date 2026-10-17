@@ -80,3 +80,31 @@ def test_uncommitted_writes_roll_back(db):
     assert db.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
     assert db.execute("SELECT kwh FROM daily_totals").fetchone()[0] == 5.0
     assert db.execute("SELECT COUNT(*) FROM top_days_alltime").fetchone()[0] == 0
+
+
+def test_update_top_days_writes_only_changed_ranks(db):
+    for n in range(1, 13):
+        record_daily_total(db, f"2026-02-{n:02d}", float(n))
+    assert update_top_days(db, "2026-02-12") == 20  # first build: 10 yearly + 10 all-time
+    assert update_top_days(db, "2026-02-12") == 0   # nothing changed -> no writes
+
+    record_daily_total(db, "2026-02-12", 12.5)       # today's total rises, still #1
+    assert update_top_days(db, "2026-02-12") == 2   # just its yearly + all-time row
+    assert db.execute("SELECT date, kwh FROM top_days_alltime WHERE rank = 1").fetchone() == ("2026-02-12", 12.5)
+
+    record_daily_total(db, "2026-02-01", 10.5)       # #12 -> #3 shifts ranks 3..10 down
+    update_top_days(db, "2026-02-01")
+    assert [r[0] for r in db.execute("SELECT date FROM top_days_alltime ORDER BY rank").fetchall()] == [
+        "2026-02-12", "2026-02-11", "2026-02-01", "2026-02-10", "2026-02-09",
+        "2026-02-08", "2026-02-07", "2026-02-06", "2026-02-05", "2026-02-04"]
+
+
+def test_update_top_days_drops_ranks_when_list_shrinks(db):
+    """The Admin re-backfill can delete a day's total, shrinking a short list."""
+    record_daily_total(db, "2026-03-01", 5.0)
+    record_daily_total(db, "2026-03-02", 6.0)
+    update_top_days(db, "2026-03-02")
+    db.execute("DELETE FROM daily_totals WHERE date = '2026-03-02'")
+    update_top_days(db, "2026-03-02")
+    assert db.execute("SELECT rank, date FROM top_days_alltime").fetchall() == [(1, "2026-03-01")]
+    assert db.execute("SELECT rank, date FROM top_days_yearly").fetchall() == [(1, "2026-03-01")]
