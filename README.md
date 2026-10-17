@@ -39,7 +39,7 @@ and the dashboard - don't duplicate this logic elsewhere. Small cross-cutting he
 ### `collector/collect.py`
 One-shot script: poll the inverter's current reading, backfill any missing history, insert
 into Turso. Run once per invocation - `collector/run_loop.py` repeats it every 5 minutes
-(used by `collect.yml`, and locally to cover a window by hand: `uv run collector/run_loop.py
+(used by `collect.yml`, and locally to cover a stretch by hand: `uv run collector/run_loop.py
 --until 17:00`).
 - Live poll: `InverterDetailInfoNewone` (AC/DC voltage/current/frequency, temperature, energy
   totals) + `GroupList` (health status).
@@ -99,7 +99,7 @@ uv sync                          # installs deps into .venv, using pyproject.tom
 cp .env.example .env              # fill in real values - see the comments in that file
 uv run db/apply_schema.py          # once for a fresh DB, or after editing db/schema.sql
 uv run collector/collect.py       # one-shot: poll + backfill + insert
-uv run collector/run_loop.py      # poll every 5 min until 19:00 IST
+uv run collector/run_loop.py      # poll every 5 min until stopped (--until HH:MM to stop)
 uv run alerts/daily_alert.py       # one-shot: send today's summary notification
 uv run streamlit run dashboard/app.py
 uv run pytest                      # test suite (no network needed)
@@ -117,18 +117,20 @@ obtain each of these):
 
 Workflows, all using `uv sync --locked` + `uv run <script>`:
 
-- **`.github/workflows/collect.yml`** - polls every 5 minutes through 05:30-19:00 IST as a
+- **`.github/workflows/collect.yml`** - polls every 5 minutes, **24/7**, as a never-ending
   **chain of runs**: each run loops internally (`collector/run_loop.py`, real `sleep`) for
-  up to 340 min (GitHub kills jobs at 6h), then dispatches its own successor via `gh
-  workflow run` ~10 min before its cap. GitHub's `schedule:` trigger has been starting runs
-  3.5-4.5h late, but `workflow_dispatch` starts within seconds, so only the first run of the
-  day depends on the scheduler. The `schedule:` entries just start (or revive) the chain and
-  exit immediately if a run is already in progress. Successive runs overlap briefly, so
+  up to 340 min (GitHub kills jobs at 6h), then dispatches its own successor
+  (`.github/scripts/collect_handoff.sh` -> `gh workflow run`) ~10 min before its cap.
+  GitHub's `schedule:` trigger has been starting runs 3.5-4.5h late, but `workflow_dispatch`
+  starts within seconds. The every-3h `schedule:` entry only revives the chain if it ever
+  dies, exiting immediately while a chain run is active; if two chains ever coexist, the
+  older one stops at its next handoff (newest wins). Night polls are cheap no-ops - the
+  inverter is offline and its last reading just dedupes. Successive runs overlap briefly, so
   `collect.py` *does* run concurrently with itself - safe by design (verified: `INSERT OR
   IGNORE` + an `ON CONFLICT DO UPDATE` upsert on the single `collector_state` row are both
   atomic; tested with 4 truly concurrent processes racing on the same empty data with zero
-  errors or duplicates). Manual run: `gh workflow run collect.yml` polls once; add
-  `-f mode=chain` to start a chain.
+  errors or duplicates). Manual run: `gh workflow run collect.yml` polls once; `-f
+  mode=chain` starts a chain (add `-f hops=1 -f max_minutes=8` for a short test chain).
 - **`.github/workflows/daily_alert.yml`** - single daily cron at 21:00 IST (15:30 UTC). GitHub
   often starts it 1-4h late (sometimes past IST midnight), so `daily_alert.py` treats any
   run before 06:00 IST as a late run for the previous day. To re-send a specific day, run it

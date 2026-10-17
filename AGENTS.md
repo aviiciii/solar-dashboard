@@ -27,15 +27,23 @@ process kept awake by collect.yml's ping - and also runs locally.
   This was originally a local JSON file; it was moved to the DB specifically because the
   collector runs on ephemeral GitHub Actions runners - a local file would silently reset to
   zero every run, defeating the whole point of backoff. Don't move it back to a file.
-- **`collect.yml` is a self-dispatching chain, not a set of cron segments.** Each run loops
-  internally (`collector/run_loop.py`, `sleep`-based, 5 min cadence) for up to 340 min and
-  then starts its successor with `gh workflow run`. The earlier design - 4-5 cron kickoffs of
-  ~4h15m segments overlapping by 1h - lost 1-3h of live data most mornings once GitHub's
-  scheduler started delaying every run by 3.5-4.5h (Oct 2026); `workflow_dispatch` starts
-  within seconds. `schedule:` entries only start/revive the chain and no-op while a run is in
-  progress; the `hops` input bounds the chain. Don't go back to fixed cron segments.
+- **`collect.yml` is a 24/7 self-dispatching chain, not a set of cron segments.** Each run
+  loops internally (`collector/run_loop.py`, `sleep`-based, 5 min cadence) for up to 340 min
+  and then starts its successor (`.github/scripts/collect_handoff.sh`). It runs through the
+  night on purpose - night polls are cheap no-ops, and having no daily start/stop means a
+  delayed kickoff can't cost data. The earlier design - 4-5 daytime cron kickoffs of ~4h15m
+  segments overlapping by 1h - lost 1-3h of live data most mornings once GitHub's scheduler
+  started delaying every run by 3.5-4.5h (Oct 2026); `workflow_dispatch` starts within
+  seconds. The every-3h `schedule:` only revives a dead chain and no-ops while a chain run is
+  active. Don't go back to fixed cron segments.
+- **Parallel chains converge to one via newest-wins** (`collect_handoff.sh`): a run doesn't
+  dispatch a successor if a newer `workflow_dispatch` chain run is active. Scheduled runs are
+  deliberately ignored by that check (one that's about to skip itself must not also stop the
+  live chain), and runs are told apart by `run-name` ("Collect (chain)" / "Collect (once)") -
+  keep that run-name if you edit the workflow. `hops` defaults to unlimited; set it only for
+  test chains.
 - **Successive chain runs deliberately overlap ~10 min** (the successor is dispatched before
-  the predecessor's cap), and two chains can briefly coexist if two scheduled kickoffs race.
+  the predecessor's cap), and two chains can briefly coexist until they converge.
   So `collect.py` genuinely runs concurrently with itself - **verified safe**, not just
   assumed: `INSERT OR IGNORE` (keyed on `timestamp`)
   and the `collector_state` row's `ON CONFLICT DO UPDATE` upsert are both atomic at the DB

@@ -1,22 +1,25 @@
 name: Collect solar readings
+run-name: Collect (${{ github.event_name == 'schedule' && 'chain' || inputs.mode }})
 
-# Polls every 5 minutes through the 05:30-19:00 IST collection window as a CHAIN of runs:
-# each run loops internally (collector/run_loop.py, real `sleep`, clock-aligned) for up to
-# 340 min - a GitHub-hosted job dies at 6h - and ~10 min before that cap dispatches its own
-# successor via `gh workflow run`, so the two overlap briefly instead of leaving a gap.
+# Polls every 5 minutes, 24/7, as a never-ending CHAIN of runs: each run loops internally
+# (collector/run_loop.py, real `sleep`, clock-aligned) for up to 340 min - a GitHub-hosted
+# job dies at 6h - and ~10 min before that cap dispatches its own successor
+# (.github/scripts/collect_handoff.sh -> `gh workflow run`), so the two overlap briefly
+# instead of leaving a gap. Night-time polls are cheap no-ops (the inverter is offline, so
+# its last reading just dedupes), and running round the clock means there's no daily
+# start/stop boundary for a delayed kickoff to miss.
 #
 # Why chain instead of one `schedule:` entry per segment: GitHub's scheduler has been
 # starting these runs 3.5-4.5h late, every day (observed Oct 2026 - far worse than the
 # "tens of minutes" of jitter fixed segments with 1h overlaps were sized for), which left a
 # 1-3h hole in live data most mornings, right at peak production. `workflow_dispatch`
-# events start within seconds, so only the chain's first link depends on the scheduler.
+# events start within seconds, so only a chain's first link depends on the scheduler.
 #
-# The `schedule:` entries below just start (or revive) the chain. A scheduled run exits
-# immediately if any other run of this workflow is already in progress, so normally only
-# the first kickoff of the day does anything; the later ones are a safety net in case a
-# handoff ever fails. A run kicked off before 05:30 IST sleeps until then (counting toward
-# its 340 min). `hops` caps how many successors a chain may spawn (~3 runs cover a day),
-# so a bug can never chain forever.
+# The `schedule:` entries below only revive the chain if it ever dies (a failed dispatch,
+# a GitHub outage): a scheduled run exits immediately if any other chain run is active. If
+# two chains ever coexist, collect_handoff.sh's newest-wins rule ends the older one at its
+# next handoff. `hops` (default -1 = unlimited) can bound a chain - handy for testing a
+# short chain from a branch without starting one that runs forever.
 #
 # Overlapping runs mean collect.py genuinely runs concurrently with itself - verified safe:
 # every insert is `INSERT OR IGNORE` keyed on `timestamp`, and the single-row
@@ -26,29 +29,18 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "once = a single poll; chain = loop through today's window, handing off to successors"
+        description: "once = a single poll; chain = loop 24/7, handing off to successors"
         default: once
         type: choice
         options: [once, chain]
       hops:
-        description: "chain mode: max number of successor runs this run may still dispatch"
-        default: "3"
+        description: "chain mode: successors this run may still dispatch (-1 = unlimited)"
+        default: "-1"
       max_minutes:
         description: "chain mode: this run's own length cap"
         default: "340"
-      start:
-        description: "chain mode: first poll no earlier than (IST HH:MM)"
-        default: "05:30"
-      until:
-        description: "chain mode: stop time today (IST HH:MM)"
-        default: "19:00"
   schedule:
-    - cron: "30 20 * * *" # 02:00 IST - three early kickoffs, since GH routinely
-    - cron: "30 21 * * *" # 03:00 IST   starts these hours late; whichever arrives
-    - cron: "30 22 * * *" # 04:00 IST   first starts the day's chain
-    - cron: "30 2 * * *"  # 08:00 IST - revive the chain if a handoff failed
-    - cron: "30 5 * * *"  # 11:00 IST
-    - cron: "30 8 * * *"  # 14:00 IST
+    - cron: "17 */3 * * *" # every 3h: revive the chain if it died (no-op while it's running)
 
 permissions:
   contents: read
@@ -66,10 +58,12 @@ jobs:
         id: guard
         if: github.event_name == 'schedule'
         run: |
-          others=$(gh run list --workflow collect.yml --status in_progress --json databaseId \
-            -q "[.[] | select(.databaseId != ${{ github.run_id }})] | length")
+          others=$(gh run list --workflow collect.yml --limit 30 --json databaseId,status,displayTitle -q "
+            [.[] | select(.databaseId != ${{ github.run_id }}
+                          and (.status == \"in_progress\" or .status == \"queued\")
+                          and (.displayTitle | contains(\"chain\")))] | length")
           if [ "$others" -gt 0 ]; then
-            echo "chain already running ($others other run(s) in progress) - nothing to do"
+            echo "chain already running ($others other chain run(s) active) - nothing to do"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -116,10 +110,8 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           MODE: ${{ github.event_name == 'schedule' && 'chain' || inputs.mode }}
-          HOPS: ${{ inputs.hops || '3' }}
+          HOPS: ${{ inputs.hops || '-1' }}
           MAX_MINUTES: ${{ inputs.max_minutes || '340' }}
-          START: ${{ inputs.start || '05:30' }}
-          UNTIL: ${{ inputs.until || '19:00' }}
         run: |
           uv run db/apply_schema.py  # once per job; collect.py doesn't re-run it every poll
 
@@ -132,9 +124,7 @@ jobs:
           fi
 
           handoff=()
-          if [ "$HOPS" -gt 0 ]; then
-            next="-f mode=chain -f hops=$((HOPS - 1)) -f max_minutes=$MAX_MINUTES -f start=$START -f until=$UNTIL"
-            handoff=(--handoff-cmd "gh workflow run collect.yml --ref $GITHUB_REF_NAME $next")
+          if [ "$HOPS" -ne 0 ]; then
+            handoff=(--handoff-cmd "bash .github/scripts/collect_handoff.sh")
           fi
-          uv run collector/run_loop.py --start "$START" --until "$UNTIL" \
-            --max-minutes "$MAX_MINUTES" "${handoff[@]}"
+          uv run collector/run_loop.py --max-minutes "$MAX_MINUTES" "${handoff[@]}"

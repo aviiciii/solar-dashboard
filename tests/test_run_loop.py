@@ -41,3 +41,13 @@ def test_plan_window_until_is_always_today():
 
 def test_plan_window_uncapped():
     assert plan_window(at(8, 0), "05:30", "19:00", None, 10) == (at(8, 0), at(19, 0), None)
+
+
+def test_plan_window_24_7_always_hands_off():
+    """collect.yml's mode: no window, so every run hands off at its cap - even at night."""
+    assert plan_window(at(22, 0), None, None, 340, 10) == (at(22, 0), at(3, 40) + timedelta(days=1),
+                                                           at(3, 30) + timedelta(days=1))
+
+
+def test_plan_window_no_window_no_cap_runs_forever():
+    assert plan_window(at(8, 0), None, None, None, 10) == (at(8, 0), None, None)
